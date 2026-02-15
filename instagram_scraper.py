@@ -42,6 +42,11 @@ EMAIL_DOMAINS = [
     "@icloud.com",
     "@live.com",
     "@mail.com",
+    "@aol.com",
+    "@protonmail.com",
+    "@zoho.com",
+    "@yandex.com",
+    "@gmx.com",
 ]
 
 # Email regex
@@ -124,6 +129,8 @@ class InstagramScraper:
         '"Manager" OR "General Manager" OR "Senior Manager"',
         '"VP" OR "Vice President" OR "COO" OR "CFO" OR "CTO"',
         '"Head of" OR "Partner" OR "Owner"',
+        '"Consultant" OR "Advisor" OR "Specialist" OR "Lead"',
+        '"Entrepreneur" OR "Business Development" OR "Sales"',
     ]
 
     def __init__(self, headless: bool = True):
@@ -580,12 +587,14 @@ class InstagramScraper:
 
     def _build_email_queries(self, place: str, keywords: str) -> list[str]:
         """
-        Build email-mode queries:
-          site:instagram.com "<place>" ("@gmail.com" OR "@hotmail.com" OR ...)
-        We split email domains into groups of 3 and join with OR.
+        Build email-mode queries with multiple strategies to maximize leads:
+          1. Email domain chunks with site:instagram.com
+          2. Generic 'email' / 'contact' keyword queries
+          3. Business-oriented queries
         """
         queries = []
-        # Chunk email domains into groups of 3 joined with OR
+
+        # Strategy 1: Chunk email domains into groups of 3 joined with OR
         for i in range(0, len(EMAIL_DOMAINS), 3):
             chunk = EMAIL_DOMAINS[i:i + 3]
             domain_part = " OR ".join(f'"{d}"' for d in chunk)
@@ -593,20 +602,63 @@ class InstagramScraper:
             if keywords:
                 q += f' "{keywords}"'
             queries.append(q)
+
+        # Strategy 2: Generic contact / email keyword queries
+        contact_keywords = [
+            '"email" OR "contact" OR "DM for"',
+            '"book now" OR "call" OR "whatsapp"',
+            '"order" OR "inquir" OR "business"',
+        ]
+        for ck in contact_keywords:
+            q = f'site:instagram.com "{place}" ({ck})'
+            if keywords:
+                q += f' "{keywords}"'
+            queries.append(q)
+
+        # Strategy 3: Niche-specific broad sweep
+        if keywords:
+            queries.append(
+                f'site:instagram.com "{keywords}" "{place}"'
+            )
+            queries.append(
+                f'site:instagram.com "{keywords}" "{place}" "@"'
+            )
+
+        # Strategy 4: Location-only broad sweep (catches businesses in area)
+        queries.append(
+            f'site:instagram.com "{place}" "@gmail.com" OR "@yahoo.com" OR "@hotmail.com"'
+        )
+
         return queries
 
     def _build_profile_queries(self, keywords: str, place: str) -> list[str]:
         """
-        Build profile-mode queries using role groups:
-          site:instagram.com ("CEO" OR "Founder") "<place>"
-        Parentheses ensure the site: restriction applies to all OR branches.
+        Build profile-mode queries using role groups plus generic queries
+        for maximum lead coverage.
         """
         queries = []
+
+        # 1. Role-based queries
         for role_group in self.ROLE_GROUPS:
             q = f'site:instagram.com ({role_group}) "{place}"'
             if keywords:
                 q += f' "{keywords}"'
             queries.append(q)
+
+        # 2. Generic niche + location query (no role filter)
+        if keywords:
+            queries.append(
+                f'site:instagram.com "{keywords}" "{place}"'
+            )
+            queries.append(
+                f'site:instagram.com "{keywords}" "{place}" "business"'
+            )
+
+        # 3. Broad sweep for businesses in the area
+        queries.append(
+            f'site:instagram.com "{place}" "CEO" OR "Owner" OR "Founder" OR "Manager"'
+        )
+
         return queries
 
     # ---- Main public API -----------------------------------------------
@@ -616,7 +668,7 @@ class InstagramScraper:
         keywords: str,
         place: str,
         search_type: str = "emails",
-        max_pages: int = 3,
+        max_pages: int = 5,
     ) -> list[dict]:
         """
         Main scraping entry point.

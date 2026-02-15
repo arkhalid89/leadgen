@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+# Ensure Chrome finds the right binary and runs rootless
+ENV CHROME_BIN=/usr/bin/google-chrome-stable
 
 # Install Chrome and dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,6 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
+    libxss1 \
+    libxtst6 \
+    libx11-xcb1 \
+    libxcb-dri3-0 \
+    libpango-1.0-0 \
+    libcairo2 \
     xdg-utils \
     && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y /tmp/chrome.deb \
@@ -35,10 +43,10 @@ WORKDIR /app
 
 # Copy requirements first for layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
-# Copy application code
-COPY app.py scraper.py linkedin_scraper.py ./
+# Copy ALL application code (including instagram_scraper.py)
+COPY app.py scraper.py linkedin_scraper.py instagram_scraper.py ./
 COPY templates/ templates/
 COPY static/ static/
 
@@ -47,8 +55,5 @@ RUN mkdir -p output
 
 # Expose port
 EXPOSE 5000
-
-# Run with gunicorn for production
-RUN pip install --no-cache-dir gunicorn
 
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "300", "app:app"]

@@ -95,6 +95,9 @@ class LinkedInScraper:
         '"Manager" OR "General Manager" OR "Senior Manager"',
         '"VP" OR "Vice President" OR "COO" OR "CFO" OR "CTO"',
         '"Head of" OR "Partner" OR "Owner"',
+        '"CMO" OR "Chief Marketing Officer" OR "Chief Operating Officer"',
+        '"Consultant" OR "Advisor" OR "Specialist" OR "Lead"',
+        '"Entrepreneur" OR "Business Development" OR "Sales Director"',
     ]
 
     def __init__(self, headless: bool = True):
@@ -510,14 +513,36 @@ class LinkedInScraper:
     ) -> list[str]:
         """
         Build multiple Google queries — one per executive-role group —
-        so we cast a wide net for CEOs, Directors, Managers, etc.
+        plus generic industry queries to cast the widest possible net.
         """
         queries = []
+
+        # 1. Role-based queries
         for role_group in self.ROLE_GROUPS:
             q = f'site:linkedin.com/in/ {role_group} "{place}"'
             if niche:
                 q += f' "{niche}"'
             queries.append(q)
+
+        # 2. Generic niche + location query (no role filter)
+        if niche:
+            queries.append(
+                f'site:linkedin.com/in/ "{niche}" "{place}"'
+            )
+            # 3. "works at" / "at" patterns
+            queries.append(
+                f'site:linkedin.com/in/ "{place}" "at" "{niche}"'
+            )
+            # 4. Industry keyword variations
+            queries.append(
+                f'site:linkedin.com/in/ "{niche}" "{place}" "experience"'
+            )
+
+        # 5. Location-only broad sweep
+        queries.append(
+            f'site:linkedin.com/in/ "{place}" "CEO" OR "Manager" OR "Owner" OR "Founder"'
+        )
+
         return queries
 
     # ---- Main public API -----------------------------------------------
@@ -527,7 +552,7 @@ class LinkedInScraper:
         niche: str,
         place: str,
         search_type: str = "profiles",
-        max_pages: int = 3,
+        max_pages: int = 5,
     ) -> list[dict]:
         """
         Main scraping method.
@@ -557,8 +582,14 @@ class LinkedInScraper:
                 queries = self._build_executive_queries(niche, place)
             else:
                 queries = [
-                    f'site:linkedin.com/company/ "{niche}" "{place}"'
+                    f'site:linkedin.com/company/ "{niche}" "{place}"',
+                    f'site:linkedin.com/company/ "{niche}" "{place}" "employees"',
+                    f'site:linkedin.com/company/ "{place}" "{niche}" "about"',
                 ]
+                if niche:
+                    queries.append(
+                        f'site:linkedin.com/company/ "{niche}" "{place}" "industry"'
+                    )
 
             total_queries = len(queries)
             all_results: list[dict] = []
