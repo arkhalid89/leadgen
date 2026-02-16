@@ -105,12 +105,29 @@ class LinkedInScraper:
         self.driver = None
         self._progress_callback = None
         self._should_stop = False
+        self._partial_leads: list[dict] = []
+        self._scrape_stats = {
+            "queries_completed": 0,
+            "total_queries": 0,
+            "leads_found": 0,
+            "results_parsed": 0,
+            "total_results": 0,
+            "phase": "idle",
+        }
 
     def set_progress_callback(self, callback):
         self._progress_callback = callback
 
     def stop(self):
         self._should_stop = True
+
+    def get_partial_leads(self) -> list[dict]:
+        """Return leads collected so far (used when stopping early)."""
+        return list(self._partial_leads)
+
+    @property
+    def scrape_stats(self) -> dict:
+        return dict(self._scrape_stats)
 
     def _report_progress(self, message: str, percentage: int = -1):
         logger.info(message)
@@ -678,6 +695,7 @@ class LinkedInScraper:
             List of dicts (profile or company data)
         """
         self._should_stop = False
+        self._partial_leads = []
         leads: list[dict] = []
 
         try:
@@ -700,6 +718,8 @@ class LinkedInScraper:
 
             total_queries = len(queries)
             all_results: list[dict] = []
+            self._scrape_stats["total_queries"] = total_queries * 2  # Google + Bing
+            self._scrape_stats["phase"] = "searching"
 
             # Phase 1: Google search
             for qi, query in enumerate(queries):
@@ -714,10 +734,11 @@ class LinkedInScraper:
 
                 results = self._google_search(query, num_pages=max_pages)
                 all_results.extend(results)
+                self._scrape_stats["queries_completed"] = qi + 1
 
-                # Pause between different queries to look human
+                # Reduced pause between queries for speed
                 if qi < total_queries - 1 and not self._should_stop:
-                    time.sleep(random.uniform(4, 8))
+                    time.sleep(random.uniform(2, 4))
 
             # Phase 2: Bing search (secondary engine — less rate limiting)
             google_count = len(all_results)
@@ -737,9 +758,10 @@ class LinkedInScraper:
 
                 bing_results = self._bing_search(query, num_pages=max_pages)
                 all_results.extend(bing_results)
+                self._scrape_stats["queries_completed"] = total_queries + qi + 1
 
                 if qi < total_queries - 1 and not self._should_stop:
-                    time.sleep(random.uniform(2, 4))
+                    time.sleep(random.uniform(1, 2))
 
             if not all_results:
                 self._report_progress(
@@ -748,6 +770,8 @@ class LinkedInScraper:
                 return leads
 
             total = len(all_results)
+            self._scrape_stats["total_results"] = total
+            self._scrape_stats["phase"] = "parsing"
             self._report_progress(
                 f"Found {total} search results. Parsing…", 60,
             )
@@ -768,22 +792,27 @@ class LinkedInScraper:
                     parsed = self._parse_company_from_serp(result)
 
                 if parsed:
-                    leads.append(asdict(parsed))
+                    lead_dict = asdict(parsed)
+                    leads.append(lead_dict)
+                    self._partial_leads.append(lead_dict)
+                    self._scrape_stats["leads_found"] = len(leads)
 
+                self._scrape_stats["results_parsed"] = idx + 1
                 progress = 60 + int((idx / total) * 35)
                 if idx % 5 == 0:
                     self._report_progress(
-                        f"Parsed {idx + 1}/{total} results…",
+                        f"Parsed {idx + 1}/{total} results… ({len(leads)} leads)",
                         min(progress, 95),
                     )
 
+            self._scrape_stats["phase"] = "done"
             self._report_progress(
                 f"Done! Found {len(leads)} {search_type}.", 100,
             )
 
         except Exception as e:
             logger.error(f"LinkedIn scraping failed: {e}")
-            self._report_progress(f"Error: {str(e)}", -1)
+            self._report_progress(f"Error: {str(e)}. Saved {len(self._partial_leads)} partial leads.", -1)
             raise
         finally:
             self._close_driver()

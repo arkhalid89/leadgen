@@ -1,26 +1,29 @@
 """
 Multi-Source Web Crawler — Lead Generation Engine
-Crawls multiple search engines (Google, Bing) and business directory sites
-to build a massive database of business leads with emails, phones,
-websites, and social profiles.
+Searches Google, Bing, and DuckDuckGo via HTTP requests (no browser
+automation) and deep-scrapes discovered websites for emails, phones,
+addresses, and social profiles.
 
 Sources:
-  1. Google Search (general web — not restricted to any site)
-  2. Bing Search
-  3. Yellow Pages / Business Directory patterns
-  4. Website crawling for email & social extraction
+  1. Google Search    (HTTP — parses /url?q= redirect links)
+  2. Bing Search      (HTTP — parses li.b_algo containers)
+  3. DuckDuckGo HTML  (HTTP — most bot-friendly engine)
+  4. Website crawling  (HTTP — checks main page + /contact, /about)
 
-This is the most productive scraper in the suite — it casts the widest net
-by searching the open web instead of being limited to a single platform.
+No Selenium / headless browser is required, which makes this scraper
+faster, lighter, and far less likely to be blocked by CAPTCHAs.
 """
 
 import re
+import json
 import time
 import random
 import logging
 import warnings
-from dataclasses import dataclass, asdict, field
-from urllib.parse import quote_plus, urljoin, urlparse
+from dataclasses import dataclass, asdict
+from urllib.parse import (
+    quote_plus, urljoin, urlparse, unquote, parse_qs,
+)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -28,16 +31,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    WebDriverException,
-    TimeoutException,
-)
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from ddgs import DDGS
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
@@ -91,7 +85,7 @@ SKIP_DOMAINS = {
     "wikipedia.org", "amazon.com", "ebay.com", "apple.com",
     "microsoft.com", "github.com", "stackoverflow.com",
     "cloudflare.com", "gstatic.com", "googleapis.com",
-    "googleusercontent.com", "yelp.com",
+    "googleusercontent.com", "yelp.com", "duckduckgo.com",
 }
 
 
@@ -121,42 +115,72 @@ class WebLead:
 # ---------------------------------------------------------------------------
 
 class WebCrawlerScraper:
-    """Multi-source web crawler for maximum lead generation."""
+    """
+    Multi-source web crawler for maximum lead generation.
+
+    Uses plain HTTP requests (no Selenium / headless browser) for search
+    engines, which is faster and avoids CAPTCHA / bot-detection issues.
+    """
 
     USER_AGENTS = [
         (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/144.0.0.0 Safari/537.36"
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/144.0.0.0 Safari/537.36"
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
         (
             "Mozilla/5.0 (X11; Linux x86_64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/143.0.0.0 Safari/537.36"
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/18.2 Safari/605.1.15"
+        ),
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) "
+            "Gecko/20100101 Firefox/134.0"
         ),
     ]
 
     def __init__(self, headless: bool = True):
         self.headless = headless
-        self.driver = None
         self._progress_callback = None
         self._should_stop = False
-        # Reusable HTTP session
+        self._partial_leads: list[dict] = []
+        self._scrape_stats = {
+            "queries_completed": 0,
+            "total_queries": 0,
+            "leads_found": 0,
+            "websites_scanned": 0,
+            "total_websites": 0,
+            "phase": "idle",
+        }
+
+        # Reusable HTTP session with connection pooling
         self._http_session = requests.Session()
         self._http_session.verify = False
         self._http_session.headers.update({
             "User-Agent": random.choice(self.USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         })
         adapter = HTTPAdapter(
-            pool_connections=10, pool_maxsize=20,
-            max_retries=Retry(total=2, backoff_factor=0.2),
+            pool_connections=15, pool_maxsize=30,
+            max_retries=Retry(total=2, backoff_factor=0.05),
         )
         self._http_session.mount("https://", adapter)
         self._http_session.mount("http://", adapter)
@@ -167,100 +191,49 @@ class WebCrawlerScraper:
     def stop(self):
         self._should_stop = True
 
+    def get_partial_leads(self) -> list[dict]:
+        """Return leads collected so far (used when stopping early)."""
+        return list(self._partial_leads)
+
+    @property
+    def scrape_stats(self) -> dict:
+        return dict(self._scrape_stats)
+
     def _report_progress(self, message: str, percentage: int = -1):
         logger.info(message)
         if self._progress_callback:
             self._progress_callback(message, percentage)
 
-    # ---- Browser -------------------------------------------------------
+    # ---- Utility -------------------------------------------------------
 
-    def _init_driver(self):
-        chrome_options = Options()
-        if self.headless:
-            chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--lang=en-US")
-        chrome_options.add_argument("--log-level=3")
-        chrome_options.add_argument(
-            "--disable-blink-features=AutomationControlled"
-        )
-        chrome_options.add_experimental_option(
-            "excludeSwitches", ["enable-automation", "enable-logging"]
-        )
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        ua = random.choice(self.USER_AGENTS)
-        chrome_options.add_argument(f"--user-agent={ua}")
-
-        self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.implicitly_wait(2)
-
-        try:
-            self.driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {
-                    "source": """
-                        Object.defineProperty(navigator, 'webdriver', {
-                            get: () => undefined
-                        });
-                    """
-                },
-            )
-        except Exception:
-            pass
-
-    def _close_driver(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.driver = None
-
-    # ---- Consent / CAPTCHA ---------------------------------------------
-
-    def _handle_consent(self):
-        selectors = [
-            "//button[contains(., 'Accept all')]",
-            "//button[contains(., 'Accept')]",
-            "//button[contains(., 'I agree')]",
-            "//button[@id='L2AGLb']",
-            "//button[@id='W0wltc']",
-        ]
-        for sel in selectors:
-            try:
-                btn = self.driver.find_element(By.XPATH, sel)
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(2)
-                    return True
-            except (NoSuchElementException, WebDriverException):
-                continue
-        return False
-
-    def _check_captcha(self) -> bool:
-        try:
-            src = self.driver.page_source.lower()
-            return any(
-                kw in src
-                for kw in ("captcha", "unusual traffic", "recaptcha")
-            )
-        except Exception:
+    def _is_valid_result_url(self, url: str) -> bool:
+        """Check that a URL is a real external business site."""
+        if not url or not url.startswith("http"):
             return False
+        domain = urlparse(url).netloc.lower()
+        root = ".".join(domain.split(".")[-2:])
+        return root not in SKIP_DOMAINS
+
+    def _random_ua_headers(self, referer: str = "") -> dict:
+        """Return a fresh set of headers with a random User-Agent."""
+        h = {"User-Agent": random.choice(self.USER_AGENTS)}
+        if referer:
+            h["Referer"] = referer
+        return h
 
     # ---- Build search queries ------------------------------------------
 
-    def _build_queries(self, keyword: str, place: str) -> list[tuple[str, str]]:
+    def _build_queries(
+        self, keyword: str, place: str,
+    ) -> list[tuple[str, str]]:
         """
         Build a diverse set of (query, engine) tuples for maximum coverage.
-        Returns list of (query_string, "google"|"bing").
+        Returns list of (query_string, "google" | "bing" | "duckduckgo").
         """
-        queries = []
+        queries: list[tuple[str, str]] = []
 
         # --- Google queries ---
-        google_queries = [
+        google_qs = [
             f'"{keyword}" "{place}" email phone',
             f'"{keyword}" "{place}" contact',
             f'"{keyword}" in {place} "phone" OR "email" OR "contact"',
@@ -272,11 +245,11 @@ class WebCrawlerScraper:
             f'inurl:directory "{keyword}" "{place}"',
             f'"{keyword}" services "{place}" contact us',
         ]
-        for q in google_queries:
+        for q in google_qs:
             queries.append((q, "google"))
 
-        # --- Bing queries (different phrasing for variety) ---
-        bing_queries = [
+        # --- Bing queries ---
+        bing_qs = [
             f'"{keyword}" "{place}" email phone contact',
             f'"{keyword}" business "{place}" directory listing',
             f'"{keyword}" "{place}" "@gmail.com" OR "@yahoo.com"',
@@ -286,190 +259,252 @@ class WebCrawlerScraper:
             f'"{keyword}" shop store "{place}" phone',
             f'"{keyword}" agency firm "{place}" contact',
         ]
-        for q in bing_queries:
+        for q in bing_qs:
             queries.append((q, "bing"))
+
+        # --- DuckDuckGo queries (simpler phrasing works best) ---
+        ddg_qs = [
+            f'{keyword} {place} email phone contact',
+            f'{keyword} business {place} directory',
+            f'{keyword} {place} contact details address',
+            f'{keyword} company {place} phone email website',
+            f'{keyword} {place} professional services contact',
+            f'{keyword} {place} local business listing',
+        ]
+        for q in ddg_qs:
+            queries.append((q, "duckduckgo"))
 
         return queries
 
-    # ---- Google Search -------------------------------------------------
+    # ---- Google HTTP Search --------------------------------------------
 
-    def _google_search(self, query: str, num_pages: int = 5) -> list[dict]:
-        """Search Google for business websites (not limited to any site:)."""
+    def _google_search(self, query: str, num_pages: int = 3) -> list[dict]:
+        """
+        Search Google via plain HTTP.  Parses redirect-style /url?q= links
+        that Google sends in the non-JavaScript version of its results page.
+        Falls back to div.g containers if present.
+        """
         results: list[dict] = []
+        seen: set[str] = set()
 
         for page in range(num_pages):
             if self._should_stop:
                 break
 
             start = page * 10
-            search_url = (
-                f"https://www.google.com/search"
-                f"?q={quote_plus(query)}&start={start}&hl=en&num=10"
-            )
-
             try:
-                self.driver.get(search_url)
-                time.sleep(3.0 + random.uniform(1.0, 3.0))
+                resp = self._http_session.get(
+                    "https://www.google.com/search",
+                    params={
+                        "q": query, "start": str(start),
+                        "hl": "en", "num": "10",
+                    },
+                    headers=self._random_ua_headers(
+                        "https://www.google.com/"
+                    ),
+                    timeout=12,
+                )
+                if resp.status_code != 200:
+                    logger.warning("Google HTTP %d", resp.status_code)
+                    continue
 
-                if page == 0:
-                    self._handle_consent()
-                    time.sleep(1)
-
-                if self._check_captcha():
-                    logger.warning("Google CAPTCHA — backing off…")
-                    time.sleep(15 + random.uniform(5, 15))
-                    self.driver.get(search_url)
-                    time.sleep(5)
-                    if self._check_captcha():
-                        logger.error("Still blocked. Skipping query.")
+                lower = resp.text.lower()
+                if "captcha" in lower or "unusual traffic" in lower:
+                    logger.warning("Google CAPTCHA on HTTP — backing off")
+                    time.sleep(10 + random.uniform(5, 10))
+                    resp = self._http_session.get(
+                        "https://www.google.com/search",
+                        params={
+                            "q": query, "start": str(start),
+                            "hl": "en", "num": "10",
+                        },
+                        headers=self._random_ua_headers(
+                            "https://www.google.com/"
+                        ),
+                        timeout=12,
+                    )
+                    lower2 = resp.text.lower()
+                    if "captcha" in lower2 or "unusual traffic" in lower2:
+                        logger.error("Still blocked by Google — skipping.")
                         break
 
-                # Parse results
-                page_results = self._parse_google_results()
-                results.extend(page_results)
+                soup = BeautifulSoup(resp.text, "lxml")
 
-                try:
-                    self.driver.find_element(By.ID, "pnnext")
-                except NoSuchElementException:
-                    break
-
-            except WebDriverException as e:
-                logger.error(f"Google error: {e}")
-                continue
-
-            if page < num_pages - 1:
-                time.sleep(random.uniform(2.0, 5.0))
-
-        return results
-
-    def _parse_google_results(self) -> list[dict]:
-        """Extract URLs + snippets from Google SERP."""
-        results = []
-        try:
-            divs = self.driver.find_elements(By.CSS_SELECTOR, "div.g")
-            for div in divs:
-                try:
-                    a_tag = div.find_element(By.CSS_SELECTOR, "a[href]")
-                    href = a_tag.get_attribute("href") or ""
-                    if not href.startswith("http"):
+                # Strategy 1: /url?q= redirect links (non-JS Google)
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if "/url?q=" not in href:
                         continue
-
-                    # Skip search engine / social domains
-                    domain = urlparse(href).netloc.lower()
-                    root_domain = ".".join(domain.split(".")[-2:])
-                    if root_domain in SKIP_DOMAINS:
+                    actual = unquote(
+                        href.split("/url?q=")[1].split("&")[0]
+                    )
+                    if not self._is_valid_result_url(actual):
                         continue
+                    if actual in seen:
+                        continue
+                    seen.add(actual)
 
-                    title = ""
+                    title = a_tag.get_text(strip=True)[:150]
                     snippet = ""
-                    try:
-                        title = div.find_element(
-                            By.CSS_SELECTOR, "h3"
-                        ).text.strip()
-                    except NoSuchElementException:
-                        pass
-                    try:
-                        snippet_el = div.find_element(
-                            By.CSS_SELECTOR,
-                            "div.VwiC3b, div[data-sncf], "
-                            "div[style*='-webkit-line-clamp']",
-                        )
-                        snippet = snippet_el.text.strip()
-                    except NoSuchElementException:
-                        try:
-                            snippet = div.text.strip()[:300]
-                        except Exception:
-                            pass
+                    parent = a_tag.find_parent()
+                    if parent:
+                        nxt = parent.find_next_sibling()
+                        if nxt:
+                            snippet = nxt.get_text(strip=True)[:300]
 
                     results.append({
-                        "url": href, "title": title, "snippet": snippet
+                        "url": actual, "title": title,
+                        "snippet": snippet,
                     })
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.debug(f"Google parse error: {e}")
+
+                # Strategy 2: div.g containers (JS-rendered, if any)
+                for div in soup.select("div.g"):
+                    a_tag = div.find("a", href=True)
+                    if not a_tag:
+                        continue
+                    href = a_tag.get("href", "")
+                    if "/url?q=" in href:
+                        href = unquote(
+                            href.split("/url?q=")[1].split("&")[0]
+                        )
+                    if not self._is_valid_result_url(href):
+                        continue
+                    if href in seen:
+                        continue
+                    seen.add(href)
+
+                    title = ""
+                    h3 = div.find("h3")
+                    if h3:
+                        title = h3.get_text(strip=True)[:150]
+                    snippet = ""
+                    for sel in (
+                        "div.VwiC3b", "div[data-sncf]", "span.st"
+                    ):
+                        s = div.select_one(sel)
+                        if s:
+                            snippet = s.get_text(strip=True)[:300]
+                            break
+                    if not snippet:
+                        snippet = div.get_text(strip=True)[:300]
+
+                    results.append({
+                        "url": href, "title": title,
+                        "snippet": snippet,
+                    })
+
+            except Exception as e:
+                logger.error("Google HTTP error: %s", e)
+                continue
+
+            time.sleep(2.0 + random.uniform(1.0, 3.0))
+
         return results
 
-    # ---- Bing Search ---------------------------------------------------
+    # ---- Bing HTTP Search ----------------------------------------------
 
-    def _bing_search(self, query: str, num_pages: int = 5) -> list[dict]:
-        """Search Bing for business websites."""
+    def _bing_search(self, query: str, num_pages: int = 3) -> list[dict]:
+        """Search Bing via plain HTTP requests."""
         results: list[dict] = []
+        seen: set[str] = set()
 
         for page in range(num_pages):
             if self._should_stop:
                 break
 
             first = page * 10 + 1
-            search_url = (
-                f"https://www.bing.com/search"
-                f"?q={quote_plus(query)}&first={first}&count=10"
-            )
-
             try:
-                self.driver.get(search_url)
-                time.sleep(2.0 + random.uniform(1.0, 2.0))
+                resp = self._http_session.get(
+                    "https://www.bing.com/search",
+                    params={
+                        "q": query, "first": str(first), "count": "10",
+                    },
+                    headers=self._random_ua_headers(
+                        "https://www.bing.com/"
+                    ),
+                    timeout=12,
+                )
+                if resp.status_code != 200:
+                    logger.warning("Bing HTTP %d", resp.status_code)
+                    continue
 
-                if page == 0:
-                    try:
-                        btn = self.driver.find_element(By.ID, "bnp_btn_accept")
-                        if btn.is_displayed():
-                            btn.click()
-                            time.sleep(1)
-                    except (NoSuchElementException, WebDriverException):
-                        pass
+                soup = BeautifulSoup(resp.text, "lxml")
 
-                page_results = self._parse_bing_results()
-                results.extend(page_results)
+                for item in soup.select("li.b_algo"):
+                    a_tag = item.select_one("h2 a")
+                    if not a_tag:
+                        a_tag = item.find("a", href=True)
+                    if not a_tag:
+                        continue
 
-                try:
-                    self.driver.find_element(By.CSS_SELECTOR, "a.sb_pagN")
-                except NoSuchElementException:
+                    href = a_tag.get("href", "")
+                    if not self._is_valid_result_url(href):
+                        continue
+                    if href in seen:
+                        continue
+                    seen.add(href)
+
+                    title = a_tag.get_text(strip=True)[:150]
+                    snippet = ""
+                    cap = item.select_one("div.b_caption p")
+                    if cap:
+                        snippet = cap.get_text(strip=True)[:300]
+                    else:
+                        p = item.find("p")
+                        if p:
+                            snippet = p.get_text(strip=True)[:300]
+
+                    results.append({
+                        "url": href, "title": title,
+                        "snippet": snippet,
+                    })
+
+                if not soup.select_one("a.sb_pagN"):
                     break
 
-            except WebDriverException as e:
-                logger.error(f"Bing error: {e}")
+            except Exception as e:
+                logger.error("Bing HTTP error: %s", e)
                 continue
 
-            if page < num_pages - 1:
-                time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(1.5 + random.uniform(0.5, 2.0))
 
         return results
 
-    def _parse_bing_results(self) -> list[dict]:
-        """Extract URLs + snippets from Bing SERP."""
-        results = []
+    # ---- DuckDuckGo Search (via ddgs library) ---------------------------
+
+    def _duckduckgo_search(
+        self, query: str, num_pages: int = 3,
+    ) -> list[dict]:
+        """
+        Search DuckDuckGo using the ``ddgs`` library which handles
+        browser impersonation and anti-bot measures automatically.
+        """
+        results: list[dict] = []
+        seen: set[str] = set()
+        max_results = num_pages * 10  # ~10 results per "page"
+
         try:
-            items = self.driver.find_elements(By.CSS_SELECTOR, "li.b_algo")
-            for item in items:
-                try:
-                    a_tag = item.find_element(By.CSS_SELECTOR, "h2 a")
-                    href = a_tag.get_attribute("href") or ""
-                    if not href.startswith("http"):
-                        continue
-
-                    domain = urlparse(href).netloc.lower()
-                    root_domain = ".".join(domain.split(".")[-2:])
-                    if root_domain in SKIP_DOMAINS:
-                        continue
-
-                    title = a_tag.text.strip()
-                    snippet = ""
-                    try:
-                        snippet_el = item.find_element(
-                            By.CSS_SELECTOR, "div.b_caption p"
-                        )
-                        snippet = snippet_el.text.strip()[:300]
-                    except NoSuchElementException:
-                        pass
-
-                    results.append({
-                        "url": href, "title": title, "snippet": snippet
-                    })
-                except Exception:
+            ddg_results = DDGS().text(
+                query, max_results=max_results,
+            )
+            for item in ddg_results:
+                if self._should_stop:
+                    break
+                href = item.get("href", "")
+                if not self._is_valid_result_url(href):
                     continue
+                if href in seen:
+                    continue
+                seen.add(href)
+
+                results.append({
+                    "url": href,
+                    "title": (item.get("title", "") or "")[:150],
+                    "snippet": (item.get("body", "") or "")[:300],
+                })
         except Exception as e:
-            logger.debug(f"Bing parse error: {e}")
+            logger.error("DDG search error: %s", e)
+
         return results
 
     # ---- Website deep scraping -----------------------------------------
@@ -512,8 +547,7 @@ class WebCrawlerScraper:
                     title_tag = soup.find("title")
                     if title_tag and title_tag.string:
                         name = title_tag.string.strip()
-                        # Clean common suffixes
-                        for sep in [" | ", " - ", " — ", " – "]:
+                        for sep in [" | ", " - ", " \u2014 ", " \u2013 "]:
                             if sep in name:
                                 name = name.split(sep)[0].strip()
                         if name and len(name) < 100:
@@ -525,13 +559,18 @@ class WebCrawlerScraper:
                         "meta", attrs={"name": "description"}
                     )
                     if meta_desc and meta_desc.get("content"):
-                        lead.description = meta_desc["content"].strip()[:200]
+                        lead.description = (
+                            meta_desc["content"].strip()[:200]
+                        )
 
                 # Emails from mailto: links
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if href.startswith("mailto:"):
-                        email = href.replace("mailto:", "").split("?")[0].strip()
+                    href_val = a["href"]
+                    if href_val.startswith("mailto:"):
+                        email = (
+                            href_val.replace("mailto:", "")
+                            .split("?")[0].strip()
+                        )
                         if self._is_valid_email(email):
                             all_emails.add(email.lower())
 
@@ -542,14 +581,14 @@ class WebCrawlerScraper:
 
                 # Phones from tel: links
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if href.startswith("tel:"):
-                        phone = href.replace("tel:", "").strip()
+                    href_val = a["href"]
+                    if href_val.startswith("tel:"):
+                        phone = href_val.replace("tel:", "").strip()
                         phone = re.sub(r"[^\d+\-() ]", "", phone)
                         if len(phone) >= 7:
                             all_phones.add(phone)
 
-                # Phones from page text (only from likely sections)
+                # Phones from page text (likely sections only)
                 for el in soup.find_all(
                     ["p", "span", "div", "a", "li"],
                     string=re.compile(
@@ -559,16 +598,18 @@ class WebCrawlerScraper:
                 ):
                     parent_text = el.get_text()
                     for m in PHONE_RE.findall(parent_text):
-                        cleaned = re.sub(r"[^\d+\-() ]", "", m).strip()
-                        if len(cleaned) >= 7 and len(cleaned) <= 20:
+                        cleaned = re.sub(
+                            r"[^\d+\-() ]", "", m,
+                        ).strip()
+                        if 7 <= len(cleaned) <= 20:
                             all_phones.add(cleaned)
 
                 # Social links
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
+                    href_val = a["href"]
                     for platform, pattern in SOCIAL_PATTERNS.items():
                         if not found_socials[platform]:
-                            mt = pattern.match(href)
+                            mt = pattern.match(href_val)
                             if mt:
                                 found_socials[platform] = mt.group(0)
 
@@ -579,12 +620,12 @@ class WebCrawlerScraper:
                         if mt:
                             found_socials[platform] = mt.group(0)
 
-                # Address patterns
+                # Address from structured data
                 if not lead.address:
-                    # Look for address in structured data
-                    for script in soup.find_all("script", type="application/ld+json"):
+                    for script in soup.find_all(
+                        "script", type="application/ld+json",
+                    ):
                         try:
-                            import json
                             data = json.loads(script.string or "")
                             if isinstance(data, dict):
                                 addr = data.get("address", {})
@@ -596,33 +637,38 @@ class WebCrawlerScraper:
                                         addr.get("postalCode", ""),
                                         addr.get("addressCountry", ""),
                                     ]
-                                    full = ", ".join(p for p in parts if p)
+                                    full = ", ".join(
+                                        p for p in parts if p
+                                    )
                                     if full:
                                         lead.address = full[:200]
                         except Exception:
                             pass
 
                 # Early exit if we have everything
-                if all_emails and all_phones and all(found_socials.values()):
+                if (all_emails and all_phones
+                        and all(found_socials.values())):
                     break
 
             except requests.RequestException:
                 continue
             except Exception as e:
-                logger.debug(f"Error scraping {page_url}: {e}")
+                logger.debug("Error scraping %s: %s", page_url, e)
                 continue
 
         # Assign to lead
         if all_emails:
             lead.email = "; ".join(sorted(all_emails))
         if all_phones:
-            lead.phone = "; ".join(sorted(all_phones)[:3])  # max 3 phones
+            lead.phone = "; ".join(sorted(all_phones)[:3])
         for platform, url_val in found_socials.items():
             setattr(lead, platform, url_val)
 
         # Only return if we found something useful
         has_contact = lead.email or lead.phone
-        has_name = lead.business_name and lead.business_name != "Unknown"
+        has_name = (
+            lead.business_name and lead.business_name != "Unknown"
+        )
         if has_contact or has_name:
             return lead
         return None
@@ -654,14 +700,12 @@ class WebCrawlerScraper:
         url = result.get("url", "")
         combined = f"{title} {snippet}"
 
-        # Extract emails from snippet
-        emails = set()
+        emails: set[str] = set()
         for m in EMAIL_RE.findall(combined):
             if self._is_valid_email(m):
                 emails.add(m.lower())
 
-        # Extract phones from snippet
-        phones = set()
+        phones: set[str] = set()
         for m in PHONE_RE.findall(combined):
             cleaned = re.sub(r"[^\d+\-() ]", "", m).strip()
             if 7 <= len(cleaned) <= 20:
@@ -676,10 +720,9 @@ class WebCrawlerScraper:
         lead.email = "; ".join(sorted(emails))
         lead.phone = "; ".join(sorted(phones)[:3])
 
-        # Name from title
         if title:
             name = title
-            for sep in [" | ", " - ", " — ", " – "]:
+            for sep in [" | ", " - ", " \u2014 ", " \u2013 "]:
                 if sep in name:
                     name = name.split(sep)[0].strip()
             lead.business_name = name[:100]
@@ -695,12 +738,12 @@ class WebCrawlerScraper:
         self,
         keyword: str,
         place: str,
-        max_pages: int = 5,
+        max_pages: int = 3,
     ) -> list[dict]:
         """
         Main scraping entry point.
 
-        Searches Google + Bing with multiple query patterns, then deep-scrapes
+        Searches Google + Bing + DuckDuckGo via HTTP, then deep-scrapes
         the found websites in parallel for emails, phones, and socials.
 
         Args:
@@ -712,52 +755,68 @@ class WebCrawlerScraper:
             List of WebLead dicts
         """
         self._should_stop = False
-        leads: list[dict] = []
+        self._partial_leads = []
 
         try:
-            self._report_progress("Initializing browser...", 2)
-            self._init_driver()
+            self._report_progress("Building search queries...", 2)
 
             queries = self._build_queries(keyword, place)
             total_queries = len(queries)
             all_search_results: list[dict] = []
             snippet_leads: list[WebLead] = []
+            self._scrape_stats["total_queries"] = total_queries
+            self._scrape_stats["phase"] = "searching"
 
-            # Phase 1: Search engines
+            # Phase 1: Search engines (HTTP - no browser needed)
             for qi, (query, engine) in enumerate(queries):
                 if self._should_stop:
                     break
 
                 pct = 3 + int((qi / total_queries) * 40)
                 self._report_progress(
-                    f"{engine.title()} search ({qi + 1}/{total_queries})…",
+                    f"{engine.title()} search "
+                    f"({qi + 1}/{total_queries})...",
                     pct,
                 )
 
                 if engine == "google":
-                    results = self._google_search(query, num_pages=max_pages)
+                    results = self._google_search(
+                        query, num_pages=max_pages,
+                    )
+                elif engine == "bing":
+                    results = self._bing_search(
+                        query, num_pages=max_pages,
+                    )
                 else:
-                    results = self._bing_search(query, num_pages=max_pages)
+                    results = self._duckduckgo_search(
+                        query, num_pages=max_pages,
+                    )
 
                 all_search_results.extend(results)
+                self._scrape_stats["queries_completed"] = qi + 1
 
                 # Quick snippet extraction
                 for r in results:
                     snippet_lead = self._extract_lead_from_snippet(
-                        r, keyword, place
+                        r, keyword, place,
                     )
                     if snippet_lead:
                         snippet_leads.append(snippet_lead)
+                        self._partial_leads.append(asdict(snippet_lead))
+                        self._scrape_stats["leads_found"] = len(
+                            self._partial_leads
+                        )
 
                 # Delay between queries
                 if qi < total_queries - 1 and not self._should_stop:
-                    delay = random.uniform(3, 6) if engine == "google" else random.uniform(1.5, 3)
-                    time.sleep(delay)
+                    if engine == "google":
+                        time.sleep(random.uniform(2, 4))
+                    elif engine == "bing":
+                        time.sleep(random.uniform(1, 2))
+                    else:
+                        time.sleep(random.uniform(0.5, 1.5))
 
-            # Close browser — we use HTTP session for website scraping
-            self._close_driver()
-
-            # Deduplicate search results by domain
+            # Phase 2: Deduplicate and deep-scrape websites
             seen_domains: set[str] = set()
             unique_urls: list[str] = []
             for r in all_search_results:
@@ -768,15 +827,18 @@ class WebCrawlerScraper:
                     unique_urls.append(url)
 
             total_urls = len(unique_urls)
+            self._scrape_stats["total_websites"] = total_urls
+            self._scrape_stats["phase"] = "deep_scraping"
             self._report_progress(
-                f"Found {total_urls} unique websites + {len(snippet_leads)} "
-                f"snippet leads. Deep-scraping websites…", 45,
+                f"Found {total_urls} unique websites + "
+                f"{len(snippet_leads)} snippet leads. "
+                f"Deep-scraping websites...",
+                45,
             )
 
-            # Phase 2: Deep-scrape websites in parallel
             deep_leads: list[WebLead] = []
             if unique_urls and not self._should_stop:
-                with ThreadPoolExecutor(max_workers=10) as executor:
+                with ThreadPoolExecutor(max_workers=15) as executor:
                     futures = {
                         executor.submit(self._scrape_website, url): url
                         for url in unique_urls
@@ -784,36 +846,51 @@ class WebCrawlerScraper:
                     done_count = 0
                     for future in as_completed(futures):
                         done_count += 1
+                        self._scrape_stats["websites_scanned"] = (
+                            done_count
+                        )
                         if self._should_stop:
-                            executor.shutdown(wait=False, cancel_futures=True)
+                            executor.shutdown(
+                                wait=False, cancel_futures=True,
+                            )
                             break
                         try:
-                            lead = future.result()
+                            lead = future.result(timeout=8)
                             if lead:
                                 deep_leads.append(lead)
+                                self._partial_leads.append(
+                                    asdict(lead)
+                                )
+                                self._scrape_stats["leads_found"] = (
+                                    len(self._partial_leads)
+                                )
                         except Exception as e:
-                            logger.debug(f"Website scrape error: {e}")
+                            logger.debug(
+                                "Website scrape error: %s", e,
+                            )
 
-                        if done_count % 5 == 0 or done_count == total_urls:
-                            pct = 45 + int((done_count / total_urls) * 50)
+                        if (done_count % 5 == 0 or
+                                done_count == total_urls):
+                            pct = 45 + int(
+                                (done_count / total_urls) * 50
+                            )
                             self._report_progress(
-                                f"Scraped {done_count}/{total_urls} websites "
-                                f"({len(deep_leads)} leads found)…",
+                                f"Scraped {done_count}/{total_urls} "
+                                f"websites "
+                                f"({len(deep_leads)} leads found)...",
                                 min(pct, 95),
                             )
 
-            # Phase 3: Merge snippet leads + deep leads, deduplicate
+            # Phase 3: Merge snippet + deep leads, deduplicate
             all_leads: list[WebLead] = []
             seen_keys: set[str] = set()
 
-            # Deep leads first (more complete)
             for lead in deep_leads:
                 key = lead.website or lead.business_name
                 if key and key not in seen_keys:
                     seen_keys.add(key)
                     all_leads.append(lead)
 
-            # Then snippet leads
             for lead in snippet_leads:
                 key = lead.website or lead.business_name
                 if key and key not in seen_keys:
@@ -821,18 +898,25 @@ class WebCrawlerScraper:
                     all_leads.append(lead)
 
             leads = [asdict(l) for l in all_leads]
+            self._partial_leads = list(leads)
+            self._scrape_stats["leads_found"] = len(leads)
+            self._scrape_stats["phase"] = "done"
 
             self._report_progress(
-                f"Done! Found {len(leads)} leads from {total_queries} queries "
-                f"across Google & Bing.", 100,
+                f"Done! Found {len(leads)} leads from "
+                f"{total_queries} queries across "
+                f"Google, Bing & DuckDuckGo.",
+                100,
             )
 
         except Exception as e:
-            logger.error(f"Web crawler failed: {e}")
-            self._report_progress(f"Error: {str(e)}", -1)
+            logger.error("Web crawler failed: %s", e)
+            self._report_progress(
+                f"Error: {e}. Saved "
+                f"{len(self._partial_leads)} partial leads.",
+                -1,
+            )
             raise
-        finally:
-            self._close_driver()
 
         return leads
 
@@ -847,17 +931,17 @@ def clean_web_leads(leads: list[dict]) -> list[dict]:
     seen: set[str] = set()
 
     for lead in leads:
-        # Deduplicate by website domain or business name
         website = lead.get("website", "").strip()
         name = lead.get("business_name", "").strip()
-        domain = urlparse(website).netloc.lower() if website else ""
+        domain = (
+            urlparse(website).netloc.lower() if website else ""
+        )
 
         key = domain or name.lower()
         if not key or key in seen:
             continue
         seen.add(key)
 
-        # Clean phone
         phone = lead.get("phone", "")
         if phone:
             phone = re.sub(r"[^\d+\-();, ]", "", phone).strip()

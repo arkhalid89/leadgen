@@ -16,7 +16,11 @@ from linkedin_scraper import LinkedInScraper, clean_linkedin_leads
 from instagram_scraper import InstagramScraper, clean_instagram_leads
 from web_crawler import WebCrawlerScraper, clean_web_leads
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=os.environ.get("LEADGEN_TEMPLATE_DIR", os.path.join(os.path.dirname(__file__), "templates")),
+    static_folder=os.environ.get("LEADGEN_STATIC_DIR", os.path.join(os.path.dirname(__file__), "static")),
+)
 CORS(app)
 
 # Store active scraping jobs and their results
@@ -24,7 +28,7 @@ scraping_jobs = {}          # Google Maps jobs
 linkedin_jobs = {}          # LinkedIn jobs
 instagram_jobs = {}         # Instagram jobs
 webcrawler_jobs = {}        # Web Crawler jobs
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+OUTPUT_DIR = os.environ.get("LEADGEN_OUTPUT_DIR", os.path.join(os.path.dirname(__file__), "output"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -97,6 +101,7 @@ class LinkedInJob:
         self.error = None
         self.scraper = None
         self.created_at = datetime.now().isoformat()
+        self.started_at = datetime.now()
 
     def update_progress(self, message: str, percentage: int):
         self.message = message
@@ -104,6 +109,15 @@ class LinkedInJob:
             self.progress = percentage
 
     def to_dict(self):
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        hours, rem = divmod(int(elapsed), 3600)
+        minutes, secs = divmod(rem, 60)
+        elapsed_str = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        scrape_stats = {}
+        if self.scraper:
+            scrape_stats = self.scraper.scrape_stats
+
         return {
             "id": self.id,
             "niche": self.niche,
@@ -115,6 +129,9 @@ class LinkedInJob:
             "lead_count": len(self.leads),
             "error": self.error,
             "created_at": self.created_at,
+            "elapsed": elapsed_str,
+            "elapsed_seconds": int(elapsed),
+            "scrape_stats": scrape_stats,
         }
 
 
@@ -133,6 +150,7 @@ class InstagramJob:
         self.error = None
         self.scraper = None
         self.created_at = datetime.now().isoformat()
+        self.started_at = datetime.now()
 
     def update_progress(self, message: str, percentage: int):
         self.message = message
@@ -140,6 +158,15 @@ class InstagramJob:
             self.progress = percentage
 
     def to_dict(self):
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        hours, rem = divmod(int(elapsed), 3600)
+        minutes, secs = divmod(rem, 60)
+        elapsed_str = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        scrape_stats = {}
+        if self.scraper:
+            scrape_stats = self.scraper.scrape_stats
+
         return {
             "id": self.id,
             "keywords": self.keywords,
@@ -151,6 +178,9 @@ class InstagramJob:
             "lead_count": len(self.leads),
             "error": self.error,
             "created_at": self.created_at,
+            "elapsed": elapsed_str,
+            "elapsed_seconds": int(elapsed),
+            "scrape_stats": scrape_stats,
         }
 
 
@@ -168,6 +198,7 @@ class WebCrawlerJob:
         self.error = None
         self.scraper = None
         self.created_at = datetime.now().isoformat()
+        self.started_at = datetime.now()
 
     def update_progress(self, message: str, percentage: int):
         self.message = message
@@ -175,6 +206,15 @@ class WebCrawlerJob:
             self.progress = percentage
 
     def to_dict(self):
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        hours, rem = divmod(int(elapsed), 3600)
+        minutes, secs = divmod(rem, 60)
+        elapsed_str = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        scrape_stats = {}
+        if self.scraper:
+            scrape_stats = self.scraper.scrape_stats
+
         return {
             "id": self.id,
             "keyword": self.keyword,
@@ -185,6 +225,9 @@ class WebCrawlerJob:
             "lead_count": len(self.leads),
             "error": self.error,
             "created_at": self.created_at,
+            "elapsed": elapsed_str,
+            "elapsed_seconds": int(elapsed),
+            "scrape_stats": scrape_stats,
         }
 
 
@@ -257,14 +300,28 @@ def run_linkedin_job(job: LinkedInJob):
         cleaned = clean_linkedin_leads(raw, job.search_type)
         job.leads = cleaned
 
+        if job.status == "stopped":
+            partial = scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_linkedin_leads(partial, job.search_type)
+                job.leads = cleaned
+            job.message = f"Stopped. Saved {len(job.leads)} {job.search_type}."
+            return
+
         job.status = "completed"
         job.progress = 100
         job.message = f"Done! Found {len(cleaned)} {job.search_type}."
 
     except Exception as e:
-        job.status = "failed"
-        job.error = str(e)
-        job.message = f"Error: {str(e)}"
+        if job.scraper:
+            partial = job.scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_linkedin_leads(partial, job.search_type)
+                job.leads = cleaned
+        if job.status != "stopped":
+            job.status = "failed"
+            job.error = str(e)
+            job.message = f"Error: {str(e)}. Saved {len(job.leads)} partial leads."
 
 
 def run_instagram_job(job: InstagramJob):
@@ -280,14 +337,28 @@ def run_instagram_job(job: InstagramJob):
         cleaned = clean_instagram_leads(raw, job.search_type)
         job.leads = cleaned
 
+        if job.status == "stopped":
+            partial = scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_instagram_leads(partial, job.search_type)
+                job.leads = cleaned
+            job.message = f"Stopped. Saved {len(job.leads)} Instagram {job.search_type}."
+            return
+
         job.status = "completed"
         job.progress = 100
         job.message = f"Done! Found {len(cleaned)} Instagram {job.search_type}."
 
     except Exception as e:
-        job.status = "failed"
-        job.error = str(e)
-        job.message = f"Error: {str(e)}"
+        if job.scraper:
+            partial = job.scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_instagram_leads(partial, job.search_type)
+                job.leads = cleaned
+        if job.status != "stopped":
+            job.status = "failed"
+            job.error = str(e)
+            job.message = f"Error: {str(e)}. Saved {len(job.leads)} partial leads."
 
 
 def run_webcrawler_job(job: WebCrawlerJob):
@@ -301,14 +372,28 @@ def run_webcrawler_job(job: WebCrawlerJob):
         cleaned = clean_web_leads(raw)
         job.leads = cleaned
 
+        if job.status == "stopped":
+            partial = scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_web_leads(partial)
+                job.leads = cleaned
+            job.message = f"Stopped. Saved {len(job.leads)} leads."
+            return
+
         job.status = "completed"
         job.progress = 100
         job.message = f"Done! Found {len(cleaned)} leads from the web."
 
     except Exception as e:
-        job.status = "failed"
-        job.error = str(e)
-        job.message = f"Error: {str(e)}"
+        if job.scraper:
+            partial = job.scraper.get_partial_leads()
+            if partial:
+                cleaned = clean_web_leads(partial)
+                job.leads = cleaned
+        if job.status != "stopped":
+            job.status = "failed"
+            job.error = str(e)
+            job.message = f"Error: {str(e)}. Saved {len(job.leads)} partial leads."
 
 
 # ============================================================
@@ -499,7 +584,7 @@ def linkedin_results(job_id):
     job = linkedin_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed":
+    if job.status not in ("completed", "stopped"):
         return jsonify({"error": "Job not completed yet.", "status": job.status}), 400
     return jsonify({"leads": job.leads, "total": len(job.leads), "job": job.to_dict()})
 
@@ -509,7 +594,7 @@ def linkedin_download(job_id):
     job = linkedin_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed" or not job.leads:
+    if job.status not in ("completed", "stopped") or not job.leads:
         return jsonify({"error": "No data available for download."}), 400
 
     output = io.StringIO()
@@ -550,9 +635,13 @@ def linkedin_stop(job_id):
         return jsonify({"error": "Job not found."}), 404
     if job.scraper:
         job.scraper.stop()
+        partial = job.scraper.get_partial_leads()
+        if partial:
+            cleaned = clean_linkedin_leads(partial, job.search_type)
+            job.leads = cleaned
     job.status = "stopped"
-    job.message = "Scraping stopped by user."
-    return jsonify({"message": "Job stop requested."})
+    job.message = f"Stopped by user. Saved {len(job.leads)} {job.search_type}."
+    return jsonify({"message": f"Job stopped. {len(job.leads)} leads saved."})
 
 
 # ============================================================
@@ -594,7 +683,7 @@ def instagram_results(job_id):
     job = instagram_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed":
+    if job.status not in ("completed", "stopped"):
         return jsonify({"error": "Job not completed yet.", "status": job.status}), 400
     return jsonify({"leads": job.leads, "total": len(job.leads), "job": job.to_dict()})
 
@@ -604,7 +693,7 @@ def instagram_download(job_id):
     job = instagram_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed" or not job.leads:
+    if job.status not in ("completed", "stopped") or not job.leads:
         return jsonify({"error": "No data available for download."}), 400
 
     output = io.StringIO()
@@ -649,9 +738,13 @@ def instagram_stop(job_id):
         return jsonify({"error": "Job not found."}), 404
     if job.scraper:
         job.scraper.stop()
+        partial = job.scraper.get_partial_leads()
+        if partial:
+            cleaned = clean_instagram_leads(partial, job.search_type)
+            job.leads = cleaned
     job.status = "stopped"
-    job.message = "Scraping stopped by user."
-    return jsonify({"message": "Job stop requested."})
+    job.message = f"Stopped by user. Saved {len(job.leads)} {job.search_type}."
+    return jsonify({"message": f"Job stopped. {len(job.leads)} leads saved."})
 
 
 # ============================================================
@@ -690,7 +783,7 @@ def webcrawler_results(job_id):
     job = webcrawler_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed":
+    if job.status not in ("completed", "stopped"):
         return jsonify({"error": "Job not completed yet.", "status": job.status}), 400
     return jsonify({"leads": job.leads, "total": len(job.leads), "job": job.to_dict()})
 
@@ -700,7 +793,7 @@ def webcrawler_download(job_id):
     job = webcrawler_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
-    if job.status != "completed" or not job.leads:
+    if job.status not in ("completed", "stopped") or not job.leads:
         return jsonify({"error": "No data available for download."}), 400
 
     output = io.StringIO()
@@ -738,9 +831,13 @@ def webcrawler_stop(job_id):
         return jsonify({"error": "Job not found."}), 404
     if job.scraper:
         job.scraper.stop()
+        partial = job.scraper.get_partial_leads()
+        if partial:
+            cleaned = clean_web_leads(partial)
+            job.leads = cleaned
     job.status = "stopped"
-    job.message = "Scraping stopped by user."
-    return jsonify({"message": "Job stop requested."})
+    job.message = f"Stopped by user. Saved {len(job.leads)} leads."
+    return jsonify({"message": f"Job stopped. {len(job.leads)} leads saved."})
 
 
 if __name__ == "__main__":
