@@ -11,6 +11,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const btnScrape = document.getElementById("btnScrape");
   const btnStop = document.getElementById("btnStop");
   const btnDownload = document.getElementById("btnDownload");
+  const mapContainer = document.getElementById("mapSelector");
+  const btnUseMapSelection = document.getElementById("btnUseMapSelection");
+  const btnClearMapSelection = document.getElementById("btnClearMapSelection");
+  const mapSelectionStatus = document.getElementById("mapSelectionStatus");
   const previewQuery = document.getElementById("previewQuery");
   const progressSection = document.getElementById("progressSection");
   const progressBar = document.getElementById("progressBar");
@@ -34,6 +38,10 @@ document.addEventListener("DOMContentLoaded", () => {
   let currentJobId = null;
   let pollInterval = null;
   let allLeads = [];
+  let selectedMapArea = null;
+  let map = null;
+  let drawnItems = null;
+  let rectangleDrawer = null;
 
   // Timer
   let timerInterval = null;
@@ -95,8 +103,122 @@ document.addEventListener("DOMContentLoaded", () => {
     previewQuery.textContent = `${kw} in ${pl}`;
   }
 
+  function formatCoordinate(v) {
+    return Number(v).toFixed(6);
+  }
+
+  function updateMapSelectionStatus() {
+    if (!mapSelectionStatus) return;
+    if (!selectedMapArea) {
+      mapSelectionStatus.textContent = "No map area selected.";
+      return;
+    }
+
+    const center = selectedMapArea.center;
+    mapSelectionStatus.textContent = `Selected area center: ${formatCoordinate(center.lat)}, ${formatCoordinate(center.lng)}`;
+  }
+
+  function clearMapSelection() {
+    selectedMapArea = null;
+    if (drawnItems) {
+      drawnItems.clearLayers();
+    }
+    updateMapSelectionStatus();
+  }
+
+  function setMapSelectionFromBounds(bounds) {
+    const northEast = bounds.getNorthEast();
+    const southWest = bounds.getSouthWest();
+    const center = bounds.getCenter();
+
+    selectedMapArea = {
+      center: { lat: center.lat, lng: center.lng },
+      bounds: {
+        north: northEast.lat,
+        east: northEast.lng,
+        south: southWest.lat,
+        west: southWest.lng,
+      },
+    };
+
+    placeInput.value = `${formatCoordinate(center.lat)}, ${formatCoordinate(center.lng)}`;
+    updatePreview();
+    updateMapSelectionStatus();
+  }
+
+  function initMapSelector() {
+    if (!mapContainer || !window.L) return;
+
+    map = L.map("mapSelector", {
+      zoomControl: true,
+    }).setView([25.2048, 55.2708], 10);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polygon: false,
+        polyline: false,
+        circle: false,
+        marker: false,
+        circlemarker: false,
+        rectangle: {
+          shapeOptions: {
+            color: "#4f8cff",
+            weight: 2,
+          },
+        },
+      },
+      edit: {
+        featureGroup: drawnItems,
+        edit: false,
+        remove: false,
+      },
+    });
+    map.addControl(drawControl);
+
+    rectangleDrawer = new L.Draw.Rectangle(map, {
+      shapeOptions: {
+        color: "#4f8cff",
+        weight: 2,
+      },
+    });
+
+    map.on(L.Draw.Event.CREATED, (event) => {
+      drawnItems.clearLayers();
+      const layer = event.layer;
+      drawnItems.addLayer(layer);
+      if (layer.getBounds) {
+        setMapSelectionFromBounds(layer.getBounds());
+      }
+    });
+
+    if (btnUseMapSelection) {
+      btnUseMapSelection.addEventListener("click", () => {
+        if (rectangleDrawer) {
+          rectangleDrawer.enable();
+        }
+      });
+    }
+
+    if (btnClearMapSelection) {
+      btnClearMapSelection.addEventListener("click", () => {
+        clearMapSelection();
+      });
+    }
+
+    updateMapSelectionStatus();
+  }
+
   keywordInput.addEventListener("input", updatePreview);
   placeInput.addEventListener("input", updatePreview);
+  initMapSelector();
 
   // Form submit
   form.addEventListener("submit", async (e) => {
@@ -117,7 +239,11 @@ document.addEventListener("DOMContentLoaded", () => {
       const res = await fetch("/api/scrape", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keyword, place }),
+        body: JSON.stringify({
+          keyword,
+          place,
+          map_selection: selectedMapArea,
+        }),
       });
 
       const data = await res.json();
@@ -396,6 +522,8 @@ document.addEventListener("DOMContentLoaded", () => {
     keywordInput.disabled = !enabled;
     placeInput.disabled = !enabled;
     btnScrape.disabled = !enabled;
+    if (btnUseMapSelection) btnUseMapSelection.disabled = !enabled;
+    if (btnClearMapSelection) btnClearMapSelection.disabled = !enabled;
     if (enabled) {
       btnScrape.innerHTML = '<i class="bi bi-rocket-takeoff me-1"></i>Go';
     } else {

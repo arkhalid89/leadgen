@@ -753,6 +753,23 @@ a:hover {
   font-size: 0.75rem;
 }
 
+.map-selector {
+  width: 100%;
+  height: 320px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+}
+
+.map-help-text {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.map-selection-status {
+  font-size: 0.75rem;
+}
+
 .tool-progress-card {
   background: var(--surface-1);
   border: 1px solid var(--border-color);

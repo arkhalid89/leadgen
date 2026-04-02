@@ -556,10 +556,11 @@ def _insert_history_direct(user_id: int, job_id: str, tool: str,
 class ScrapingJob:
     """Tracks a Google Maps scraping job."""
 
-    def __init__(self, keyword: str, place: str):
+    def __init__(self, keyword: str, place: str, map_selection: dict | None = None):
         self.id = str(uuid.uuid4())[:8]
         self.keyword = keyword
         self.place = place
+        self.map_selection = map_selection or {}
         self.status = "running"
         self.progress = 0
         self.message = "Starting..."
@@ -591,6 +592,7 @@ class ScrapingJob:
             "id": self.id,
             "keyword": self.keyword,
             "place": self.place,
+            "map_selection": self.map_selection,
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
@@ -1415,11 +1417,19 @@ def start_scrape():
     data = request.get_json()
     keyword = data.get("keyword", "").strip()
     place = data.get("place", "").strip()
+    map_selection = data.get("map_selection") if isinstance(data.get("map_selection"), dict) else None
+
+    if not place and map_selection:
+        center = map_selection.get("center") if isinstance(map_selection.get("center"), dict) else {}
+        lat = center.get("lat")
+        lng = center.get("lng")
+        if lat is not None and lng is not None:
+            place = f"{lat}, {lng}"
 
     if not keyword or not place:
-        return jsonify({"error": "Both keyword and place are required."}), 400
+        return jsonify({"error": "Both keyword and place are required (or select an area on map)."}), 400
 
-    job = ScrapingJob(keyword, place)
+    job = ScrapingJob(keyword, place, map_selection=map_selection)
     scraping_jobs[job.id] = job
     _insert_history_direct(session["user_id"], job.id, "gmaps", keyword, place)
 

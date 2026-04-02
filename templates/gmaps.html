@@ -1,6 +1,15 @@
 {% extends "base.html" %} {% block title %}LeadGen — Google Maps Scraper{%
 endblock %} {% block topbar_title %}
 <h5 class="mb-0 fw-bold">Google Maps</h5>
+{% endblock %} {% block extra_css %}
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+/>
+<link
+  rel="stylesheet"
+  href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"
+/>
 {% endblock %} {% block content %}
 
 <!-- Search Form -->
@@ -56,6 +65,45 @@ endblock %} {% block topbar_title %}
       >"</small
     >
   </div>
+</div>
+
+<!-- Map Selection -->
+<div class="tool-form-card">
+  <div
+    class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2"
+  >
+    <h6 class="mb-0 fw-bold">
+      <i class="bi bi-bounding-box me-2" style="color: #4285f4"></i>Select Area
+      on Map
+    </h6>
+    <div class="d-flex gap-2">
+      <button
+        class="btn btn-outline-primary btn-sm"
+        id="btnUseMapSelection"
+        type="button"
+      >
+        <i class="bi bi-crop me-1"></i>Drag Select Area
+      </button>
+      <button
+        class="btn btn-outline-secondary btn-sm"
+        id="btnClearMapSelection"
+        type="button"
+      >
+        <i class="bi bi-x-circle me-1"></i>Clear
+      </button>
+    </div>
+  </div>
+  <p class="map-help-text mb-2">
+    Click <strong>Drag Select Area</strong>, then drag a rectangle on the map.
+    The selected area's center coordinates will be used as the search place.
+  </p>
+  <div id="mapSelector" class="map-selector"></div>
+  <small
+    id="mapSelectionStatus"
+    class="map-selection-status mt-2 d-block text-muted"
+  >
+    No map area selected.
+  </small>
 </div>
 
 <!-- Progress Section -->
@@ -174,5 +222,7 @@ endblock %} {% block topbar_title %}
 </div>
 
 {% endblock %} {% block extra_js %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 {% endblock %}
