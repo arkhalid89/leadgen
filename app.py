@@ -31,6 +31,8 @@ from scraper import GoogleMapsScraper, clean_leads
 from linkedin_scraper import LinkedInScraper, clean_linkedin_leads
 from instagram_scraper import InstagramScraper, clean_instagram_leads
 from web_crawler import WebCrawlerScraper, clean_web_leads
+from task_queue.job_store import save_job_state, get_job_state, set_job_stop_requested, is_job_stop_requested
+from workers.scraper_worker import run_scraper_job
 
 # Instagram search-type aliases (old → new)
 _IG_TYPE_MAP = {"emails": "profiles", "profiles": "profiles", "businesses": "businesses"}
@@ -118,6 +120,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Maximum number of completed jobs to keep in memory per store
 _MAX_FINISHED_JOBS = 20
+GMAPS_JOB_STATES = {"PENDING", "RUNNING", "PARTIAL", "COMPLETED", "FAILED"}
 
 
 def _cleanup_jobs(store: dict, max_keep: int = _MAX_FINISHED_JOBS):
@@ -130,6 +133,113 @@ def _cleanup_jobs(store: dict, max_keep: int = _MAX_FINISHED_JOBS):
     finished.sort(key=lambda x: getattr(x[1], "started_at", datetime.min))
     for jid, _ in finished[: len(finished) - max_keep]:
         store.pop(jid, None)
+
+
+def _state_for_frontend(job_state: dict) -> dict:
+    """Map queue job state to legacy frontend shape without losing new lifecycle fields."""
+    state = dict(job_state)
+    lifecycle = str(state.get("status", "PENDING")).upper()
+
+    if lifecycle == "COMPLETED":
+        legacy_status = "completed"
+    elif lifecycle == "FAILED":
+        legacy_status = "failed"
+    elif lifecycle == "PARTIAL":
+        legacy_status = "stopped"
+    elif lifecycle in ("RUNNING", "PENDING"):
+        legacy_status = "running"
+    else:
+        legacy_status = "running"
+
+    state["lifecycle_status"] = lifecycle
+    state["status"] = legacy_status
+    state.setdefault("progress", 0)
+    state.setdefault("message", "Queued...")
+    state.setdefault("results_count", 0)
+    state.setdefault("area_stats", {})
+    state.setdefault("lead_count", state.get("results_count", 0))
+    return state
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _run_scrape_in_thread(job_id: str, payload: dict):
+    """Background thread that runs the Google Maps scraper and updates job state."""
+    def progress_callback(message: str, percent: int, snapshot: dict | None = None):
+        if is_job_stop_requested(job_id):
+            # Signal the scraper to stop
+            pass
+        snapshot = snapshot or {}
+        area_stats = snapshot.get("area_stats") if isinstance(snapshot.get("area_stats"), dict) else {}
+        results_count = int(
+            snapshot.get("results_count") or snapshot.get("lead_count") or 0
+        )
+        update = {
+            "status": "RUNNING",
+            "progress": max(0, min(100, percent)),
+            "message": message,
+            "results_count": results_count,
+            "area_stats": area_stats,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if isinstance(snapshot.get("results"), list):
+            update["results"] = snapshot["results"]
+            update["results_count"] = len(update["results"])
+        current = get_job_state(job_id) or {}
+        current.update(update)
+        save_job_state(job_id, current)
+
+    def should_stop() -> bool:
+        return is_job_stop_requested(job_id)
+
+    try:
+        state = get_job_state(job_id) or {}
+        state.update({"status": "RUNNING", "message": "Worker started", "updated_at": datetime.utcnow().isoformat()})
+        save_job_state(job_id, state)
+
+        result = run_scraper_job(
+            payload=payload,
+            progress_callback=progress_callback,
+            should_stop=should_stop,
+        )
+
+        final_status = "PARTIAL" if result.get("status") == "PARTIAL" else "COMPLETED"
+        final_state = get_job_state(job_id) or {}
+        final_state.update({
+            "status": final_status,
+            "progress": 100,
+            "message": (
+                f"Stopped with {result.get('lead_count', 0)} leads."
+                if final_status == "PARTIAL"
+                else f"Done! Found {result.get('lead_count', 0)} leads."
+            ),
+            "results_count": int(result.get("lead_count", 0) or 0),
+            "results": result.get("leads", []),
+            "area_stats": result.get("area_stats", {}),
+            "finished_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        save_job_state(job_id, final_state)
+
+    except Exception as exc:
+        log.error(f"Scrape job {job_id} failed: {exc}")
+        failed_state = get_job_state(job_id) or {}
+        failed_state.update({
+            "status": "FAILED",
+            "message": f"Error: {str(exc)}",
+            "error": str(exc),
+            "updated_at": datetime.utcnow().isoformat(),
+            "finished_at": datetime.utcnow().isoformat(),
+        })
+        save_job_state(job_id, failed_state)
+
 
 
 # ============================================================
@@ -1413,7 +1523,7 @@ def email_outreach_tool():
 @app.route("/api/scrape", methods=["POST"])
 @subscription_required
 def start_scrape():
-    """Start a new Google Maps scraping job."""
+    """Start a new Google Maps scraping job in a background thread."""
     data = request.get_json()
     keyword = data.get("keyword", "").strip()
     place = data.get("place", "").strip()
@@ -1429,18 +1539,48 @@ def start_scrape():
     if not keyword or not place:
         return jsonify({"error": "Both keyword and place are required (or select an area on map)."}), 400
 
-    job = ScrapingJob(keyword, place, map_selection=map_selection)
-    scraping_jobs[job.id] = job
-    _insert_history_direct(session["user_id"], job.id, "gmaps", keyword, place)
+    job_id = str(uuid.uuid4())[:8]
 
-    thread = threading.Thread(target=run_scraping_job, args=(job,), daemon=True)
-    thread.start()
+    payload = {
+        "job_id": job_id,
+        "keyword": keyword,
+        "place": place,
+        "map_selection": map_selection,
+    }
 
-    return jsonify({"job_id": job.id, "message": "Scraping started."}), 202
+    initial_state = {
+        "job_id": job_id,
+        "status": "PENDING",
+        "progress": 0,
+        "message": "Starting scraper...",
+        "keyword": keyword,
+        "place": place,
+        "results_count": 0,
+        "results": [],
+        "stop_requested": False,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    save_job_state(job_id, initial_state)
+    _insert_history_direct(session["user_id"], job_id, "gmaps", keyword, place)
+
+    # Launch scraper in background thread
+    t = threading.Thread(
+        target=_run_scrape_in_thread,
+        args=(job_id, payload),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id, "message": "Scraping started."}), 202
 
 
 @app.route("/api/status/<job_id>")
 def job_status(job_id):
+    state = get_job_state(job_id)
+    if state:
+        return jsonify(_state_for_frontend(state))
+
     job = scraping_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
@@ -1449,6 +1589,20 @@ def job_status(job_id):
 
 @app.route("/api/results/<job_id>")
 def job_results(job_id):
+    state = get_job_state(job_id)
+    if state:
+        lifecycle = str(state.get("status", "PENDING")).upper()
+        leads = state.get("results", [])
+        if lifecycle not in ("COMPLETED", "PARTIAL") and not leads:
+            return jsonify({"error": "Job not completed yet.", "status": lifecycle}), 400
+        return jsonify({
+            "leads": leads,
+            "total": len(leads),
+            "partial": lifecycle not in ("COMPLETED", "PARTIAL"),
+            "status": lifecycle,
+            "job": _state_for_frontend(state),
+        })
+
     job = scraping_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
@@ -1459,6 +1613,45 @@ def job_results(job_id):
 
 @app.route("/api/download/<job_id>")
 def download_csv(job_id):
+    queue_state = get_job_state(job_id)
+    if queue_state:
+        lifecycle = str(queue_state.get("status", "PENDING")).upper()
+        leads = queue_state.get("results", [])
+        if lifecycle not in ("COMPLETED", "PARTIAL") or not leads:
+            return jsonify({"error": "No data available for download."}), 400
+
+        output = io.StringIO()
+        fieldnames = [
+            "Business Name", "Owner Name", "Phone", "Website", "Email",
+            "Address", "Rating", "Reviews", "Category",
+            "Facebook", "Instagram", "Twitter", "LinkedIn",
+            "YouTube", "TikTok", "Pinterest",
+        ]
+        key_map = {
+            "Business Name": "business_name", "Owner Name": "owner_name",
+            "Phone": "phone", "Website": "website", "Email": "email",
+            "Address": "address", "Rating": "rating", "Reviews": "reviews",
+            "Category": "category", "Facebook": "facebook",
+            "Instagram": "instagram", "Twitter": "twitter",
+            "LinkedIn": "linkedin", "YouTube": "youtube",
+            "TikTok": "tiktok", "Pinterest": "pinterest",
+        }
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for lead in leads:
+            row = {display: lead.get(key, "N/A") for display, key in key_map.items()}
+            writer.writerow(row)
+
+        output.seek(0)
+        keyword = queue_state.get("keyword", "leads")
+        place = queue_state.get("place", "area")
+        filename = f"leads_{keyword}_{place}.csv".replace(" ", "_").lower()
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
     job = scraping_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
@@ -1497,6 +1690,21 @@ def download_csv(job_id):
 
 @app.route("/api/stop/<job_id>", methods=["POST"])
 def stop_scrape(job_id):
+    queue_state = get_job_state(job_id)
+    if queue_state:
+        lifecycle = str(queue_state.get("status", "PENDING")).upper()
+        if lifecycle in ("COMPLETED", "FAILED", "PARTIAL"):
+            return jsonify({"message": f"Job already {lifecycle}."})
+        set_job_stop_requested(job_id, True)
+
+        pending = get_job_state(job_id) or queue_state
+        pending.update({
+            "message": "Stop requested. Finishing current step...",
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        save_job_state(job_id, pending)
+        return jsonify({"message": "Stop signal sent."})
+
     job = scraping_jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404

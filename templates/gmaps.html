@@ -68,6 +68,7 @@ endblock %} {% block topbar_title %}
 </div>
 
 <!-- Map Selection -->
+<div id="mapSectionWrapper">
 <div class="tool-form-card">
   <div
     class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2"
@@ -95,7 +96,7 @@ endblock %} {% block topbar_title %}
   </div>
   <p class="map-help-text mb-2">
     Click <strong>Drag Select Area</strong>, then drag a rectangle on the map.
-    The selected area's center coordinates will be used as the search place.
+    The selected area will be used as the search boundary for adaptive geo-partitioning.
   </p>
   <div id="mapSelector" class="map-selector"></div>
   <small
@@ -104,6 +105,7 @@ endblock %} {% block topbar_title %}
   >
     No map area selected.
   </small>
+</div>
 </div>
 
 <!-- Progress Section -->
@@ -149,10 +151,12 @@ endblock %} {% block topbar_title %}
     ></div>
   </div>
   <small class="text-muted" id="progressMessage">Starting...</small>
+  <div id="coverageBadge" class="mt-2" style="display: none"></div>
+  <div id="keywordsExpanded" class="mt-2" style="display: none"></div>
   <div class="d-flex gap-2 mt-3 flex-wrap" id="liveStats" style="display: none">
     <div class="live-stat-box">
       <div class="stat-val" style="color: #4285f4" id="statAreas">0 / 0</div>
-      <div class="stat-label">Areas</div>
+      <div class="stat-label">Geo Cells</div>
     </div>
     <div class="live-stat-box">
       <div class="stat-val" style="color: #22c55e" id="statLeads">0</div>
@@ -193,16 +197,16 @@ endblock %} {% block topbar_title %}
         <thead class="table-dark">
           <tr>
             <th>#</th>
-            <th>Business Name</th>
-            <th>Owner</th>
-            <th>Phone</th>
+            <th data-sort="business_name">Business Name <i class="bi bi-caret-up sort-icon" style="opacity:0.3"></i></th>
+            <th data-sort="owner_name">Owner <i class="bi bi-caret-up sort-icon" style="opacity:0.3"></i></th>
+            <th data-sort="phone">Phone</th>
             <th>Email</th>
             <th>Website</th>
             <th>Socials</th>
-            <th>Address</th>
-            <th>Rating</th>
-            <th>Reviews</th>
-            <th>Category</th>
+            <th data-sort="address">Address</th>
+            <th data-sort="rating">Rating <i class="bi bi-caret-up sort-icon" style="opacity:0.3"></i></th>
+            <th data-sort="reviews">Reviews <i class="bi bi-caret-up sort-icon" style="opacity:0.3"></i></th>
+            <th data-sort="category">Category <i class="bi bi-caret-up sort-icon" style="opacity:0.3"></i></th>
           </tr>
         </thead>
         <tbody id="resultsBody"></tbody>

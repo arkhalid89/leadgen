@@ -1,15 +1,29 @@
 """
-Google Maps Lead Scraper Module
-Scrapes business listings from Google Maps for lead generation.
+Google Maps Lead Scraper Module — Optimized Edition
+====================================================
+Scrapes business listings from Google Maps for lead generation
+using adaptive geo-partitioning for maximum coverage.
+
+Key improvements over original:
+  - Viewport-based search (navigate to coordinates + zoom)
+  - Adaptive quadtree partitioning (dense areas → more cells)
+  - Multi-keyword expansion (synonyms for broader recall)
+  - Spatial deduplication (lat/lng + fuzzy name matching)
+  - Smart scrolling with stagnation detection
+  - Proper city-wide coverage via Nominatim geocoding
 """
 
 import os
-import time
 import re
+import time
+import math
 import logging
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field, asdict
+from typing import Callable
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -17,7 +31,6 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from bs4 import BeautifulSoup
 from selenium import webdriver
 
-# Suppress SSL warnings for verify=False requests
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -31,6 +44,13 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
     WebDriverException,
 )
+
+from geo.quadtree import (
+    BoundingBox, bbox_from_place, bbox_from_map_selection,
+    bbox_from_coordinates, build_cells_for_area, zoom_for_bbox,
+)
+from utils.keyword_expander import expand_keywords
+from utils.deduplicator import deduplicate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -61,6 +81,9 @@ EMAIL_BLACKLIST = {
     'googleusercontent.com', 'gstatic.com',
 }
 
+# Regex to extract coordinates from Google Maps URL
+COORDS_RE = re.compile(r'@(-?\d+\.?\d*),(-?\d+\.?\d*)')
+
 
 @dataclass
 class BusinessLead:
@@ -74,6 +97,8 @@ class BusinessLead:
     rating: str = ""
     reviews: str = ""
     category: str = ""
+    latitude: str = ""
+    longitude: str = ""
     facebook: str = ""
     instagram: str = ""
     twitter: str = ""
@@ -84,7 +109,7 @@ class BusinessLead:
 
 
 class GoogleMapsScraper:
-    """Scrapes Google Maps search results for business leads."""
+    """Scrapes Google Maps search results for business leads with adaptive geo-partitioning."""
 
     GOOGLE_MAPS_URL = "https://www.google.com/maps"
 
@@ -93,6 +118,10 @@ class GoogleMapsScraper:
         self.driver = None
         self._progress_callback = None
         self._should_stop = False
+        self._website_workers = max(1, int(os.environ.get("LEADGEN_WEBSITE_WORKERS", "5")))
+        self._website_timeout_seconds = max(2.0, float(os.environ.get("LEADGEN_WEBSITE_TIMEOUT_SECONDS", "10")))
+        self._max_pages_per_website = max(1, int(os.environ.get("LEADGEN_WEBSITE_MAX_PAGES", "3")))
+        self._max_scroll_attempts = max(30, int(os.environ.get("LEADGEN_SCROLL_ATTEMPTS", "120")))
 
         # --- Live tracking ---
         self._area_stats = {
@@ -103,13 +132,17 @@ class GoogleMapsScraper:
             "leads_found": 0,
             "websites_scanned": 0,
             "websites_total": 0,
+            "geo_cells_total": 0,
+            "geo_cells_completed": 0,
+            "keywords_expanded": [],
+            "coverage_score": 0,
         }
         self._partial_leads: list = []  # live partial leads list
 
-        # Reusable HTTP session with connection pooling
-        self._http_session = requests.Session()
-        self._http_session.verify = False
-        self._http_session.headers.update({
+    def _new_http_session(self) -> requests.Session:
+        session = requests.Session()
+        session.verify = False
+        session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -119,47 +152,13 @@ class GoogleMapsScraper:
             "Accept-Language": "en-US,en;q=0.9",
         })
         adapter = HTTPAdapter(
-            pool_connections=15, pool_maxsize=30,
+            pool_connections=8,
+            pool_maxsize=8,
             max_retries=Retry(total=1, backoff_factor=0.05),
         )
-        self._http_session.mount("https://", adapter)
-        self._http_session.mount("http://", adapter)
-
-    # Well-known sub-areas for major cities to run multiple sub-searches
-    CITY_SUB_AREAS = {
-        "dubai": [
-            "Dubai Marina", "Downtown Dubai", "Jumeirah", "Deira",
-            "Bur Dubai", "Business Bay", "Al Barsha", "JLT",
-            "Dubai Silicon Oasis", "Dubai International City",
-            "Al Quoz", "Karama", "Satwa", "Oud Metha",
-            "Dubai Healthcare City", "DIFC", "Palm Jumeirah",
-            "Dubai Hills", "Arabian Ranches", "Motor City",
-        ],
-        "new york": [
-            "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island",
-            "Midtown Manhattan", "Lower Manhattan", "Upper East Side",
-            "Upper West Side", "Harlem", "SoHo", "Tribeca",
-            "East Village", "West Village", "Chelsea", "Williamsburg",
-        ],
-        "london": [
-            "City of London", "Westminster", "Camden", "Islington",
-            "Hackney", "Tower Hamlets", "Southwark", "Lambeth",
-            "Kensington", "Chelsea London", "Canary Wharf",
-            "Mayfair", "Shoreditch", "Notting Hill", "Brixton",
-        ],
-        "lahore": [
-            "Gulberg Lahore", "DHA Lahore", "Model Town Lahore",
-            "Johar Town Lahore", "Bahria Town Lahore", "Garden Town Lahore",
-            "Cantt Lahore", "Mall Road Lahore", "Shadman Lahore",
-            "Iqbal Town Lahore", "Wapda Town Lahore", "Township Lahore",
-        ],
-        "karachi": [
-            "Clifton Karachi", "DHA Karachi", "Gulshan-e-Iqbal Karachi",
-            "North Nazimabad Karachi", "Saddar Karachi", "Korangi Karachi",
-            "PECHS Karachi", "Gulistan-e-Johar Karachi", "Tariq Road Karachi",
-            "Bahadurabad Karachi", "FB Area Karachi",
-        ],
-    }
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
     def set_progress_callback(self, callback):
         """Set a callback function for progress updates."""
@@ -198,7 +197,6 @@ class GoogleMapsScraper:
             "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
         )
-        # Suppress logging
         chrome_options.add_argument("--log-level=3")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
@@ -219,7 +217,6 @@ class GoogleMapsScraper:
         """Navigate to Google Maps and perform a search."""
         self._report_progress(f"Searching Google Maps for: {query}", 5)
 
-        # Use the direct search URL — much more reliable than navigating and typing
         search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
         self.driver.get(search_url)
         time.sleep(2)
@@ -235,7 +232,7 @@ class GoogleMapsScraper:
         except NoSuchElementException:
             pass
 
-        # Wait for results to appear (feed panel or individual place page)
+        # Wait for results
         try:
             WebDriverWait(self.driver, 15).until(
                 lambda d: d.find_elements(By.CSS_SELECTOR, 'div[role="feed"]')
@@ -244,11 +241,50 @@ class GoogleMapsScraper:
         except TimeoutException:
             logger.warning("Timed out waiting for search results to load.")
 
+    def _search_maps_viewport(self, query: str, bbox: BoundingBox):
+        """
+        Search Google Maps within a specific viewport.
+
+        Uses the Maps URL format that includes viewport coordinates
+        to force results for a specific geographic area.
+        """
+        center_lat, center_lng = bbox.center()
+        zoom = zoom_for_bbox(bbox)
+
+        # Format: /maps/search/query/@lat,lng,zoom
+        search_url = (
+            f"https://www.google.com/maps/search/"
+            f"{query.replace(' ', '+')}/"
+            f"@{center_lat},{center_lng},{zoom}z"
+        )
+
+        self.driver.get(search_url)
+        time.sleep(2.5)
+
+        # Accept cookies / consent dialog
+        try:
+            accept_btn = self.driver.find_element(
+                By.XPATH,
+                "//button[contains(., 'Accept all') or contains(., 'Accept') or contains(., 'I agree')]"
+            )
+            accept_btn.click()
+            time.sleep(2)
+        except NoSuchElementException:
+            pass
+
+        # Wait for results
+        try:
+            WebDriverWait(self.driver, 15).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, 'div[role="feed"]')
+                or d.find_elements(By.CSS_SELECTOR, 'h1')
+            )
+        except TimeoutException:
+            logger.warning("Timed out waiting for viewport search results.")
+
     def _scroll_results(self):
-        """Scroll the results panel to load all listings."""
+        """Scroll the results panel to load all listings with smart stagnation detection."""
         self._report_progress("Scrolling to load all results...", 15)
 
-        # Find the scrollable results panel
         try:
             results_panel = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located(
@@ -260,10 +296,12 @@ class GoogleMapsScraper:
             return
 
         last_height = 0
-        scroll_attempts = 0
-        max_scroll_attempts = 50  # Safety limit
+        last_count = 0
+        stagnation = 0
+        max_scroll_attempts = self._max_scroll_attempts
+        scroll_attempt = 0
 
-        while scroll_attempts < max_scroll_attempts:
+        while scroll_attempt < max_scroll_attempts:
             if self._should_stop:
                 self._report_progress("Scraping stopped by user.")
                 return
@@ -272,7 +310,7 @@ class GoogleMapsScraper:
             self.driver.execute_script(
                 "arguments[0].scrollTop = arguments[0].scrollHeight", results_panel
             )
-            time.sleep(0.8)
+            time.sleep(0.6)
 
             # Check for "end of list" indicator
             try:
@@ -286,7 +324,7 @@ class GoogleMapsScraper:
             except NoSuchElementException:
                 pass
 
-            # Also check for the text-based end indicator
+            # Check text-based end indicator
             try:
                 page_source_snippet = results_panel.get_attribute("innerHTML")
                 if "You've reached the end of the list" in page_source_snippet:
@@ -295,22 +333,46 @@ class GoogleMapsScraper:
             except Exception:
                 pass
 
+            # Count current listing links
+            current_count = len(self.driver.find_elements(
+                By.CSS_SELECTOR, 'a[href*="/maps/place/"]'
+            ))
+
             # Check if scrolling produced new content
             new_height = self.driver.execute_script(
                 "return arguments[0].scrollHeight", results_panel
             )
-            if new_height == last_height:
-                scroll_attempts += 1
-                if scroll_attempts >= 3:
+            if new_height == last_height and current_count == last_count:
+                stagnation += 1
+                if stagnation >= 3:
+                    # Try a slight pan to force more results
+                    try:
+                        self.driver.execute_script(
+                            "arguments[0].scrollTop = arguments[0].scrollHeight - 200",
+                            results_panel
+                        )
+                        time.sleep(0.3)
+                        self.driver.execute_script(
+                            "arguments[0].scrollTop = arguments[0].scrollHeight",
+                            results_panel
+                        )
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                    stagnation += 1
+
+                if stagnation >= 5:
                     self._report_progress("No more results to load.", 30)
                     break
             else:
-                scroll_attempts = 0
+                stagnation = 0
                 last_height = new_height
+                last_count = current_count
 
-            progress = min(30, 15 + scroll_attempts)
+            scroll_attempt += 1
+            progress = min(30, 15 + scroll_attempt)
             self._report_progress(
-                f"Loading more results... (scroll cycle {scroll_attempts})",
+                f"Loading more results... ({current_count} found)",
                 progress,
             )
 
@@ -334,9 +396,21 @@ class GoogleMapsScraper:
         self._report_progress(f"Found {len(links)} business listings.", 40)
         return links
 
+    def _extract_coords_from_url(self, url: str) -> tuple[str, str]:
+        """Extract latitude/longitude from Google Maps URL."""
+        match = COORDS_RE.search(url)
+        if match:
+            return match.group(1), match.group(2)
+        return "", ""
+
     def _extract_business_detail(self, url: str) -> BusinessLead:
         """Navigate to a business page and extract details."""
         lead = BusinessLead()
+
+        # Extract coordinates from URL
+        lat, lng = self._extract_coords_from_url(url)
+        lead.latitude = lat
+        lead.longitude = lng
 
         try:
             self.driver.get(url)
@@ -351,7 +425,6 @@ class GoogleMapsScraper:
                 )
                 lead.business_name = name_el.text.strip()
             except TimeoutException:
-                # Fallback: try to get name from the URL
                 try:
                     name_from_url = url.split("/maps/place/")[1].split("/")[0]
                     lead.business_name = name_from_url.replace("+", " ")
@@ -430,10 +503,18 @@ class GoogleMapsScraper:
                 except NoSuchElementException:
                     pass
 
-            # Owner name - usually not directly shown on Google Maps,
-            # but sometimes appears in specific business types
+            # Try to extract coordinates from page URL if not from listing URL
+            if not lead.latitude:
+                try:
+                    current_url = self.driver.current_url
+                    lat, lng = self._extract_coords_from_url(current_url)
+                    lead.latitude = lat
+                    lead.longitude = lng
+                except Exception:
+                    pass
+
+            # Owner name
             try:
-                # Some businesses list the owner/proprietor
                 about_tab = self.driver.find_elements(
                     By.CSS_SELECTOR, 'div.PbZDve span'
                 )
@@ -450,170 +531,262 @@ class GoogleMapsScraper:
 
         return lead
 
-    def scrape(self, keyword: str, place: str) -> list[dict]:
+    def scrape(
+        self,
+        keyword: str,
+        place: str,
+        map_selection: dict | None = None,
+        forced_geo_cells: list[BoundingBox] | None = None,
+        force_primary_keyword_only: bool = False,
+    ) -> list[dict]:
         """
-        Main scraping method with sub-area splitting for maximum coverage.
+        Main scraping pipeline with 3-phase architecture:
 
-        Searches the main area first, then automatically searches popular
-        sub-areas of the city to find businesses Google Maps doesn't show
-        in the zoomed-out view.
+        Phase 1 — COLLECT: Scan all geo-cells with one browser, collect listing URLs
+        Phase 2 — EXTRACT: Visit each unique listing to get business details
+        Phase 3 — ENRICH: Crawl business websites in parallel for emails & socials
 
-        Args:
-            keyword: Business type to search (e.g., "restaurants")
-            place: Location to search in (e.g., "Dubai")
-
-        Returns:
-            List of BusinessLead dicts
+        This approach uses ONE browser for all cells (no duplicate browser spawning)
+        and deduplicates listing URLs across cells before extracting details.
         """
         leads = []
         self._should_stop = False
         self._partial_leads = []
-        seen_names: set[str] = set()
+        seen_slugs: set[str] = set()
 
         try:
             self._report_progress("Initializing browser...", 2)
             self._init_driver()
 
-            # Build search queries: main + sub-areas
-            queries = [f"{keyword} in {place}"]
+            # ========================================
+            # SETUP: Determine search area + keywords
+            # ========================================
+            bbox = None
 
-            # Add sub-area queries for known cities
-            place_lower = place.strip().lower()
-            sub_areas = self.CITY_SUB_AREAS.get(place_lower, [])
-            if not sub_areas:
-                # Check if place contains a known city
-                for city, areas in self.CITY_SUB_AREAS.items():
-                    if city in place_lower or place_lower in city:
-                        sub_areas = areas
-                        break
+            if map_selection and isinstance(map_selection, dict):
+                bounds = map_selection.get("bounds")
+                if bounds and isinstance(bounds, dict):
+                    bbox = bbox_from_map_selection(bounds)
+                    if bbox:
+                        self._report_progress(
+                            f"Using map selection area", 3
+                        )
+                if not bbox:
+                    center = map_selection.get("center", {})
+                    lat = center.get("lat")
+                    lng = center.get("lng")
+                    if lat is not None and lng is not None:
+                        bbox = bbox_from_coordinates(float(lat), float(lng), radius_km=5.0)
 
-            # Add keyword variations for broader coverage
-            keyword_variants = [keyword]
-            if not sub_areas:
-                keyword_variants.append(f"{keyword} services")
-                keyword_variants.append(f"{keyword} companies")
+            if not bbox:
+                coord_match = re.match(
+                    r'^(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)$', place.strip()
+                )
+                if coord_match:
+                    lat = float(coord_match.group(1))
+                    lng = float(coord_match.group(2))
+                    bbox = bbox_from_coordinates(lat, lng, radius_km=5.0)
 
-            for area in sub_areas:
-                queries.append(f"{keyword} in {area}")
+            if not bbox:
+                self._report_progress(f"Geocoding '{place}'...", 3)
+                bbox = bbox_from_place(place)
 
-            for variant in keyword_variants[1:]:
-                queries.append(f"{variant} in {place}")
+            # Build geo cells
+            if forced_geo_cells:
+                geo_cells = list(forced_geo_cells)
+            elif bbox:
+                area = bbox.area_sq_degrees()
+                if area > 0.5:
+                    target_cells = 16
+                elif area > 0.1:
+                    target_cells = 12
+                elif area > 0.01:
+                    target_cells = 8
+                else:
+                    target_cells = 4
+                geo_cells = build_cells_for_area(bbox, target_cell_count=target_cells)
+            else:
+                geo_cells = []
 
-            total_queries = len(queries)
-            all_leads: list[BusinessLead] = []
+            # Expand keywords
+            keyword_variants = [keyword] if force_primary_keyword_only else expand_keywords(keyword, max_variants=3)
+            self._area_stats["keywords_expanded"] = keyword_variants
+            self._report_progress(
+                f"Keyword variants: {', '.join(keyword_variants)}", 5
+            )
 
-            # --- Initialize area stats ---
-            self._area_stats["total_areas"] = total_queries
-            self._area_stats["completed_areas"] = 0
-            self._area_stats["current_area_index"] = 0
+            # ========================================
+            # PHASE 1: COLLECT listing URLs from all cells
+            # ========================================
+            all_listing_urls: list[str] = []
 
-            for qi, query in enumerate(queries):
-                if self._should_stop:
-                    break
+            if geo_cells:
+                # Build search jobs: primary keyword for all cells, extra variants for first cell only
+                jobs: list[tuple[str, BoundingBox]] = []
+                for cell in geo_cells:
+                    jobs.append((keyword, cell))
+                for variant in keyword_variants[1:2]:  # 1 extra variant, first cell only
+                    jobs.append((variant, geo_cells[0]))
 
-                # --- Update area stats ---
-                self._area_stats["current_area"] = query
-                self._area_stats["current_area_index"] = qi + 1
-                self._area_stats["leads_found"] = len(all_leads)
+                total_jobs = len(jobs)
+                self._area_stats["total_areas"] = total_jobs
+                self._area_stats["geo_cells_total"] = len(geo_cells)
 
-                base_pct = int((qi / total_queries) * 80)
                 self._report_progress(
-                    f"[Area {qi + 1}/{total_queries}] Searching: {query}",
-                    max(3, base_pct),
+                    f"Phase 1: Scanning {total_jobs} areas for listings...", 6
                 )
 
-                # Search on Google Maps
-                self._search_maps(query)
-
-                # Scroll to load all results
-                self._scroll_results()
-
-                if self._should_stop:
-                    break
-
-                # Collect all listing URLs
-                listing_urls = self._get_listing_links()
-
-                if not listing_urls:
-                    self._area_stats["completed_areas"] = qi + 1
-                    self._report_progress(
-                        f"[Area {qi + 1}/{total_queries}] No new listings, moving on...",
-                        base_pct + 2,
-                    )
-                    continue
-
-                # Filter out already-seen listings
-                new_urls = []
-                for url in listing_urls:
-                    try:
-                        name_slug = url.split("/maps/place/")[1].split("/")[0]
-                    except (IndexError, AttributeError):
-                        name_slug = url
-                    if name_slug not in seen_names:
-                        seen_names.add(name_slug)
-                        new_urls.append(url)
-
-                if not new_urls:
-                    self._area_stats["completed_areas"] = qi + 1
-                    continue
-
-                total = len(new_urls)
-                self._report_progress(
-                    f"[Area {qi + 1}/{total_queries}] Found {total} new businesses. Extracting details...",
-                    base_pct + 3,
-                )
-
-                for idx, url in enumerate(new_urls):
+                for ji, (kw, cell) in enumerate(jobs):
                     if self._should_stop:
                         break
 
-                    progress = base_pct + 3 + int((idx / total) * (80 / total_queries))
+                    center_lat, center_lng = cell.center()
+                    self._area_stats["current_area"] = f"{kw} @ ({center_lat:.4f}, {center_lng:.4f})"
+                    self._area_stats["current_area_index"] = ji + 1
+
+                    pct = 6 + int((ji / total_jobs) * 30)  # Phase 1 uses 6-36%
                     self._report_progress(
-                        f"[Area {qi + 1}/{total_queries}] Business {idx + 1}/{total} (total: {len(all_leads)})",
-                        min(progress, 95),
+                        f"Scanning area {ji + 1}/{total_jobs}: {kw}",
+                        pct,
                     )
+
+                    self._search_maps_viewport(kw, cell)
+                    self._scroll_results()
+
+                    if self._should_stop:
+                        break
+
+                    cell_urls = self._get_listing_links()
+
+                    # Deduplicate across cells using URL slug
+                    new_count = 0
+                    for url in cell_urls:
+                        try:
+                            slug = url.split("/maps/place/")[1].split("/")[0]
+                        except (IndexError, AttributeError):
+                            slug = url
+                        if slug not in seen_slugs:
+                            seen_slugs.add(slug)
+                            all_listing_urls.append(url)
+                            new_count += 1
+
+                    self._area_stats["completed_areas"] = ji + 1
+                    self._area_stats["geo_cells_completed"] = min(ji + 1, len(geo_cells))
+
+                    logger.info(
+                        f"Area {ji+1}/{total_jobs}: found {len(cell_urls)} listings, {new_count} new (total unique: {len(all_listing_urls)})"
+                    )
+
+            else:
+                # Fallback: text-based search
+                queries = [f"{v} in {place}" for v in keyword_variants]
+                self._area_stats["total_areas"] = len(queries)
+
+                for qi, query in enumerate(queries):
+                    if self._should_stop:
+                        break
+
+                    self._area_stats["current_area"] = query
+                    self._area_stats["current_area_index"] = qi + 1
+
+                    pct = 6 + int((qi / len(queries)) * 30)
+                    self._report_progress(
+                        f"Searching: {query}", pct,
+                    )
+
+                    self._search_maps(query)
+                    self._scroll_results()
+
+                    if self._should_stop:
+                        break
+
+                    query_urls = self._get_listing_links()
+                    for url in query_urls:
+                        try:
+                            slug = url.split("/maps/place/")[1].split("/")[0]
+                        except (IndexError, AttributeError):
+                            slug = url
+                        if slug not in seen_slugs:
+                            seen_slugs.add(slug)
+                            all_listing_urls.append(url)
+
+                    self._area_stats["completed_areas"] = qi + 1
+
+            logger.info(f"Phase 1 complete: {len(all_listing_urls)} unique listings found")
+
+            # ========================================
+            # PHASE 2: EXTRACT business details from unique URLs
+            # ========================================
+            all_leads: list[BusinessLead] = []
+
+            if all_listing_urls and not self._should_stop:
+                total_urls = len(all_listing_urls)
+                self._report_progress(
+                    f"Phase 2: Extracting details from {total_urls} businesses...", 37
+                )
+
+                for idx, url in enumerate(all_listing_urls):
+                    if self._should_stop:
+                        break
+
+                    pct = 37 + int((idx / total_urls) * 40)  # Phase 2 uses 37-77%
+                    if idx % 5 == 0 or idx == total_urls - 1:
+                        self._report_progress(
+                            f"Extracting business {idx + 1}/{total_urls}",
+                            min(pct, 77),
+                        )
 
                     lead = self._extract_business_detail(url)
                     if lead.business_name and lead.business_name != "Unknown":
-                        # Immediately crawl website for contact details before moving to next lead
-                        if lead.website:
-                            self._area_stats["websites_total"] = self._area_stats.get("websites_total", 0) + 1
-                            self._report_progress(
-                                f"[Area {qi + 1}/{total_queries}] Crawling website for {lead.business_name}...",
-                                min(progress, 95),
-                            )
-                            try:
-                                self._scrape_website(lead)
-                            except Exception as e:
-                                logger.debug(f"Website scrape error for {lead.business_name}: {e}")
-                            self._area_stats["websites_scanned"] = self._area_stats.get("websites_scanned", 0) + 1
-
                         all_leads.append(lead)
-                        # --- Update live partial leads ---
                         self._partial_leads = [asdict(l) for l in all_leads]
                         self._area_stats["leads_found"] = len(all_leads)
 
-                    time.sleep(0.15)  # Reduced from 0.4s
+                logger.info(f"Phase 2 complete: {len(all_leads)} businesses extracted")
 
-                self._area_stats["completed_areas"] = qi + 1
+            # ========================================
+            # PHASE 3: ENRICH via parallel website crawling
+            # ========================================
+            if all_leads and not self._should_stop:
+                self._crawl_websites_for_leads(
+                    all_leads,
+                    label="Enriching",
+                    progress=78,
+                )
+                # Update partial leads after enrichment
+                self._partial_leads = [asdict(l) for l in all_leads]
 
-                # Short pause between sub-area searches
-                if qi < total_queries - 1 and not self._should_stop:
-                    time.sleep(0.5)  # Reduced from 1s
-
-            # Convert dataclass leads to dicts
+            # ========================================
+            # FINAL: Deduplicate and return
+            # ========================================
             leads = [asdict(l) for l in all_leads]
+            pre_dedup = len(leads)
+
+            if leads:
+                leads = deduplicate(leads)
+                deduped = pre_dedup - len(leads)
+                if deduped > 0:
+                    self._report_progress(
+                        f"Removed {deduped} duplicates ({pre_dedup} → {len(leads)})", 95
+                    )
+
+            total_cells = self._area_stats.get("geo_cells_total", 0) or self._area_stats.get("total_areas", 1)
+            completed = self._area_stats.get("geo_cells_completed", 0) or self._area_stats.get("completed_areas", 0)
+            if total_cells > 0:
+                self._area_stats["coverage_score"] = int((completed / total_cells) * 100)
+
             self._partial_leads = leads
+            self._area_stats["leads_found"] = len(leads)
 
             self._report_progress(
-                f"Scraping complete! Found {len(leads)} leads across {total_queries} areas.", 100
+                f"Done! Found {len(leads)} unique leads.", 100
             )
 
         except Exception as e:
             logger.error(f"Scraping failed: {e}")
-            # Save whatever we have on error
-            if all_leads:
+            if 'all_leads' in dir() and all_leads:
                 leads = [asdict(l) for l in all_leads]
+                leads = deduplicate(leads)
                 self._partial_leads = leads
             self._report_progress(f"Error: {str(e)}", -1)
             raise
@@ -622,6 +795,57 @@ class GoogleMapsScraper:
             self._close_driver()
 
         return leads
+
+    def _crawl_websites_for_leads(self, leads: list[BusinessLead], label: str, progress: int):
+        website_targets = [lead for lead in leads if lead.website and lead.website != "N/A"]
+        if not website_targets:
+            logger.info("No websites to crawl — all leads missing website field.")
+            return
+
+        self._area_stats["websites_total"] = self._area_stats.get("websites_total", 0) + len(website_targets)
+        workers = min(self._website_workers, len(website_targets))
+
+        logger.info(f"Phase 3: Crawling {len(website_targets)} websites with {workers} parallel workers")
+        self._report_progress(
+            f"{label}: Crawling {len(website_targets)} websites for emails & socials...",
+            progress,
+        )
+
+        enriched_count = 0
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {
+                executor.submit(self._scrape_website, lead): lead
+                for lead in website_targets
+                if not self._should_stop
+            }
+
+            processed = 0
+            for future in as_completed(futures):
+                processed += 1
+                lead = futures[future]
+                try:
+                    future.result(timeout=self._website_timeout_seconds + 5)
+                except Exception as e:
+                    logger.warning(f"Website crawl failed for {lead.business_name} ({lead.website}): {e}")
+
+                # Check if enrichment found anything
+                if lead.email or lead.facebook or lead.instagram:
+                    enriched_count += 1
+
+                self._area_stats["websites_scanned"] = self._area_stats.get("websites_scanned", 0) + 1
+
+                if processed == len(website_targets) or processed % max(1, len(website_targets) // 4) == 0:
+                    self._report_progress(
+                        f"{label}: Websites {processed}/{len(website_targets)} (found data: {enriched_count})",
+                        progress,
+                    )
+
+                if self._should_stop:
+                    for pending in futures:
+                        pending.cancel()
+                    break
+
+        logger.info(f"Phase 3 complete: {enriched_count}/{len(website_targets)} websites yielded contact data")
 
     def _scrape_website(self, lead: BusinessLead):
         """Visit a business website to extract emails and social profiles."""
@@ -632,22 +856,35 @@ class GoogleMapsScraper:
         if not url.startswith("http"):
             url = "https://" + url
 
-        # Pages to check: homepage first, then /contact only if needed
+        # Pages to check: homepage first, then contact pages
         pages_to_check = [url]
-        for path in ["/contact", "/contact-us"]:
+        for path in ["/contact", "/contact-us", "/about", "/about-us"]:
             pages_to_check.append(urljoin(url, path))
 
         all_emails = set()
         found_socials = {k: "" for k in SOCIAL_PATTERNS}
+        deadline = time.monotonic() + self._website_timeout_seconds
+        session = self._new_http_session()
+        pages_checked = 0
 
-        for page_url in pages_to_check:
+        for page_url in pages_to_check[: self._max_pages_per_website]:
+            if self._should_stop:
+                break
             try:
-                resp = self._http_session.get(
-                    page_url, timeout=3, allow_redirects=True,
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                read_timeout = min(5.0, max(1.5, remaining))
+                resp = session.get(
+                    page_url,
+                    timeout=(3.0, read_timeout),
+                    allow_redirects=True,
                 )
                 if resp.status_code != 200:
                     continue
 
+                pages_checked += 1
                 text = resp.text
                 soup = BeautifulSoup(text, "lxml")
 
@@ -659,7 +896,6 @@ class GoogleMapsScraper:
                         if self._is_valid_email(email):
                             all_emails.add(email.lower())
 
-                # From page text via regex
                 for match in EMAIL_RE.findall(text):
                     if self._is_valid_email(match):
                         all_emails.add(match.lower())
@@ -673,28 +909,36 @@ class GoogleMapsScraper:
                             if m:
                                 found_socials[platform] = m.group(0)
 
-                # Also check raw page source if links are embedded in JS
                 for platform, pattern in SOCIAL_PATTERNS.items():
                     if not found_socials[platform]:
                         m = pattern.search(text)
                         if m:
                             found_socials[platform] = m.group(0)
 
-                # Early exit: stop checking more pages if we have email + all socials found
                 if all_emails and all(found_socials.values()):
                     break
 
-            except requests.RequestException:
+            except requests.RequestException as e:
+                logger.debug(f"HTTP error for {page_url}: {e}")
                 continue
             except Exception as e:
                 logger.debug(f"Error scraping {page_url}: {e}")
                 continue
+            finally:
+                if time.monotonic() >= deadline:
+                    break
+
+        session.close()
 
         # Assign to lead
         if all_emails:
             lead.email = "; ".join(sorted(all_emails))
         for platform, url_val in found_socials.items():
-            setattr(lead, platform, url_val)
+            if url_val:
+                setattr(lead, platform, url_val)
+
+        if all_emails or any(found_socials.values()):
+            logger.debug(f"Enriched {lead.business_name}: emails={len(all_emails)}, socials={sum(1 for v in found_socials.values() if v)} (checked {pages_checked} pages)")
 
     @staticmethod
     def _is_valid_email(email: str) -> bool:
@@ -704,7 +948,6 @@ class GoogleMapsScraper:
         domain = email.split("@")[1].lower()
         if domain in EMAIL_BLACKLIST:
             return False
-        # Filter out image/file extensions
         if domain.endswith((".png", ".jpg", ".gif", ".svg", ".webp", ".js", ".css")):
             return False
         return True
@@ -751,6 +994,8 @@ def clean_leads(leads: list[dict]) -> list[dict]:
             "rating": lead.get("rating", "N/A") or "N/A",
             "reviews": lead.get("reviews", "N/A") or "N/A",
             "category": lead.get("category", "N/A") or "N/A",
+            "latitude": lead.get("latitude", "") or "",
+            "longitude": lead.get("longitude", "") or "",
             "facebook": lead.get("facebook", "N/A") or "N/A",
             "instagram": lead.get("instagram", "N/A") or "N/A",
             "twitter": lead.get("twitter", "N/A") or "N/A",

@@ -267,7 +267,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (leads.length === 0) {
       resultsBody.innerHTML = `
         <tr>
-          <td colspan="9" class="text-center text-muted py-4">No results found.</td>
+          <td colspan="11" class="text-center text-muted py-4">No results found.</td>
         </tr>`;
       return;
     }
@@ -282,6 +282,18 @@ document.addEventListener("DOMContentLoaded", () => {
         lead.email && lead.email !== "N/A"
           ? `<a href="mailto:${escapeHtml(lead.email.split(";")[0].trim())}">${escapeHtml(truncate(lead.email, 28))}</a>`
           : "N/A";
+
+      // Operating hours
+      const hoursHtml =
+        lead.operating_hours && lead.operating_hours !== "N/A"
+          ? `<small title="${escapeHtml(lead.operating_hours)}">${escapeHtml(truncate(lead.operating_hours, 30))}</small>`
+          : '<span class="text-muted">—</span>';
+
+      // Structured data indicator
+      const dataHtml =
+        lead.has_structured_data === "Yes"
+          ? '<span class="badge bg-success" title="Has JSON-LD structured data"><i class="bi bi-braces me-1"></i>LD</span>'
+          : '<span class="text-muted">—</span>';
 
       // Build social icons
       const socials = [];
@@ -309,6 +321,8 @@ document.addEventListener("DOMContentLoaded", () => {
         <td class="cell-truncate-sm">${email}</td>
         <td class="cell-truncate-sm">${website}</td>
         <td class="cell-truncate">${escapeHtml(lead.address || "N/A")}</td>
+        <td class="cell-truncate-sm">${hoursHtml}</td>
+        <td>${dataHtml}</td>
         <td><span class="badge bg-secondary">${escapeHtml(lead.source || "web")}</span></td>
         <td style="white-space:nowrap">${socialsHtml}</td>
         <td class="cell-truncate">${escapeHtml(truncate(lead.description || "", 50))}</td>

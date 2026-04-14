@@ -283,7 +283,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function renderProfiles(leads) {
     profilesBody.innerHTML = "";
     if (leads.length === 0) {
-      profilesBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-4">No results found.</td></tr>`;
+      profilesBody.innerHTML = `<tr><td colspan="9" class="text-center text-muted py-4">No results found.</td></tr>`;
       return;
     }
     leads.forEach((l, idx) => {
@@ -295,11 +295,28 @@ document.addEventListener("DOMContentLoaded", () => {
         l.linkedin_username && l.linkedin_username !== "N/A"
           ? `<span class="badge bg-info text-dark">${escapeHtml(l.linkedin_username)}</span>`
           : "N/A";
+
+      // Seniority badge with color coding
+      let seniorityBadge = 'N/A';
+      const sl = (l.seniority_level || '').toLowerCase();
+      if (sl && sl !== 'n/a') {
+        let cls = 'bg-secondary';
+        if (sl.includes('c-suite')) cls = 'bg-warning text-dark';
+        else if (sl.includes('vp')) cls = 'bg-primary';
+        else if (sl.includes('director')) cls = 'bg-info text-dark';
+        else if (sl.includes('manager')) cls = 'bg-success';
+        else if (sl.includes('senior')) cls = 'bg-dark';
+        else if (sl.includes('partner') || sl.includes('owner')) cls = 'bg-warning text-dark';
+        else if (sl.includes('entry')) cls = 'bg-light text-dark';
+        seniorityBadge = `<span class="badge ${cls}">${escapeHtml(l.seniority_level)}</span>`;
+      }
+
       const row = document.createElement("tr");
       row.innerHTML = `
         <td>${idx + 1}</td>
         <td class="fw-semibold">${escapeHtml(l.name)}</td>
         <td>${escapeHtml(l.title)}</td>
+        <td>${seniorityBadge}</td>
         <td>${escapeHtml(l.company)}</td>
         <td>${escapeHtml(l.location)}</td>
         <td>${username}</td>

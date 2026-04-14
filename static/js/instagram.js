@@ -301,7 +301,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function renderLeads(leads) {
     leadsBody.innerHTML = "";
     if (leads.length === 0) {
-      leadsBody.innerHTML = `<tr><td colspan="11" class="text-center text-muted py-4">No results found.</td></tr>`;
+      leadsBody.innerHTML = `<tr><td colspan="13" class="text-center text-muted py-4">No results found.</td></tr>`;
       return;
     }
     leads.forEach((l, idx) => {
@@ -335,6 +335,16 @@ document.addEventListener("DOMContentLoaded", () => {
           ? `<span class="badge bg-info text-dark">${escapeHtml(l.followers)}</span>`
           : '<span class="text-muted">—</span>';
 
+      const postsHtml =
+        l.post_count && l.post_count !== "N/A"
+          ? `<span class="badge bg-dark">${escapeHtml(l.post_count)}</span>`
+          : '<span class="text-muted">—</span>';
+
+      const verifiedHtml =
+        l.is_verified === "Yes"
+          ? '<i class="bi bi-patch-check-fill" style="color:#3897f0;font-size:1rem" title="Verified"></i>'
+          : '<span class="text-muted">—</span>';
+
       const row = document.createElement("tr");
       row.innerHTML = `
         <td>${idx + 1}</td>
@@ -345,6 +355,8 @@ document.addEventListener("DOMContentLoaded", () => {
         <td>${websiteHtml}</td>
         <td>${categoryHtml}</td>
         <td>${followersHtml}</td>
+        <td>${postsHtml}</td>
+        <td>${verifiedHtml}</td>
         <td>${escapeHtml(l.location)}</td>
         <td>${profileLink}</td>
         <td class="cell-truncate">${escapeHtml(truncate(l.bio, 80))}</td>

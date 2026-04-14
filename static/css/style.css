@@ -1320,3 +1320,66 @@ a.sidebar-avatar:hover {
     grid-template-columns: 1fr;
   }
 }
+
+/* =============================================
+   Adaptive Geo-Partitioning UI
+   ============================================= */
+
+/* Map section show/hide transition */
+#mapSectionWrapper {
+  transition: opacity 0.3s ease, max-height 0.4s ease;
+  overflow: hidden;
+}
+#mapSectionWrapper[style*="display: none"] {
+  opacity: 0;
+  max-height: 0;
+}
+
+/* Sortable table headers */
+th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--transition-fast);
+}
+th[data-sort]:hover {
+  color: var(--accent) !important;
+}
+.sort-icon {
+  font-size: 0.6rem;
+  margin-left: 4px;
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+/* Coverage badge */
+#coverageBadge .badge {
+  font-size: 0.78rem;
+  padding: 5px 12px;
+  border-radius: var(--radius-full);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+/* Keywords expanded tag */
+#keywordsExpanded small {
+  font-size: 0.76rem;
+}
+
+/* Live lead row highlight */
+.lead-row {
+  animation: leadSlideIn 0.4s var(--ease-out);
+}
+@keyframes leadSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+    background: rgba(79, 140, 255, 0.06);
+  }
+  50% {
+    background: rgba(79, 140, 255, 0.04);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+    background: transparent;
+  }
+}

@@ -12,6 +12,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const btnStop = document.getElementById("btnStop");
   const btnDownload = document.getElementById("btnDownload");
   const mapContainer = document.getElementById("mapSelector");
+  const mapSection = document.getElementById("mapSectionWrapper");
   const btnUseMapSelection = document.getElementById("btnUseMapSelection");
   const btnClearMapSelection = document.getElementById("btnClearMapSelection");
   const mapSelectionStatus = document.getElementById("mapSelectionStatus");
@@ -21,6 +22,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const progressMessage = document.getElementById("progressMessage");
   const progressTitle = document.getElementById("progressTitle");
   const progressSpinner = document.getElementById("progressSpinner");
+  const coverageBadge = document.getElementById("coverageBadge");
+  const keywordsExpanded = document.getElementById("keywordsExpanded");
   const resultsSection = document.getElementById("resultsSection");
   const resultsBody = document.getElementById("resultsBody");
   const resultCount = document.getElementById("resultCount");
@@ -42,6 +45,9 @@ document.addEventListener("DOMContentLoaded", () => {
   let map = null;
   let drawnItems = null;
   let rectangleDrawer = null;
+  let sortColumn = null;
+  let sortDirection = "asc";
+  let liveLeadsRendered = false;
 
   // Timer
   let timerInterval = null;
@@ -67,19 +73,57 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Update live stats from server response
   function updateLiveStats(data) {
-    if (!data.area_stats) return;
+    if (!data) return;
     liveStats.style.display = "flex";
-    const as = data.area_stats;
+    const as = data.area_stats || {};
+    const totalCells =
+      data.total_cells || as.geo_cells_total || as.total_areas || 0;
+    const completedCells =
+      data.completed_cells || as.geo_cells_completed || as.completed_areas || 0;
+    const leadCount =
+      data.results_count || data.lead_count || as.leads_found || 0;
 
-    if (as.total_areas > 0) {
-      statAreas.textContent = `${as.completed_areas} / ${as.total_areas}`;
+    if (totalCells > 0) {
+      statAreas.textContent = `${completedCells} / ${totalCells}`;
+    } else {
+      statAreas.textContent = "0 / 0";
     }
-    statLeads.textContent = as.leads_found || data.lead_count || 0;
+    statLeads.textContent = leadCount;
 
-    if (as.websites_total > 0) {
-      statWebsites.textContent = `${as.websites_scanned} / ${as.websites_total}`;
-    } else if (as.completed_areas < as.total_areas) {
+    if ((as.websites_total || 0) > 0) {
+      statWebsites.textContent = `${as.websites_scanned || 0} / ${as.websites_total || 0}`;
+    } else if (totalCells > 0 && completedCells < totalCells) {
       statWebsites.textContent = "—";
+    } else {
+      statWebsites.textContent = "0";
+    }
+
+    // Coverage quality indicator
+    if (coverageBadge && as.coverage_score > 0) {
+      const score = as.coverage_score;
+      let label, cls;
+      if (score >= 90) {
+        label = "High";
+        cls = "bg-success";
+      } else if (score >= 60) {
+        label = "Medium";
+        cls = "bg-warning text-dark";
+      } else {
+        label = "Low";
+        cls = "bg-danger";
+      }
+      coverageBadge.innerHTML = `<span class="badge ${cls}">Coverage: ${score}% (${label})</span>`;
+      coverageBadge.style.display = "";
+    }
+
+    // Keywords expanded
+    if (
+      keywordsExpanded &&
+      as.keywords_expanded &&
+      as.keywords_expanded.length > 1
+    ) {
+      keywordsExpanded.innerHTML = `<small class="text-muted"><i class="bi bi-tags me-1"></i>Keywords: ${as.keywords_expanded.join(", ")}</small>`;
+      keywordsExpanded.style.display = "";
     }
   }
 
@@ -234,6 +278,12 @@ document.addEventListener("DOMContentLoaded", () => {
     showProgress();
     setFormEnabled(false);
     startTimer();
+    liveLeadsRendered = false;
+
+    // Hide map section during scraping
+    if (mapSection) {
+      mapSection.style.display = "none";
+    }
 
     try {
       const res = await fetch("/api/scrape", {
@@ -270,15 +320,11 @@ document.addEventListener("DOMContentLoaded", () => {
       '<span class="spinner-border spinner-border-sm me-1"></span>Stopping...';
     try {
       const res = await fetch(`/api/stop/${currentJobId}`, { method: "POST" });
-      const data = await res.json();
-      stopPolling();
-      stopTimer();
+      await res.json();
       progressTitle.textContent = "Stopped — saving results...";
       progressSpinner.style.display = "none";
       progressBar.classList.remove("progress-bar-animated");
-      setFormEnabled(true);
-      // Load whatever results were saved
-      await loadResults();
+      await loadLiveResults();
     } catch (err) {
       console.error("Stop failed:", err);
     } finally {
@@ -372,6 +418,7 @@ document.addEventListener("DOMContentLoaded", () => {
         progressSpinner.style.display = "none";
         progressBar.classList.remove("progress-bar-animated");
         setFormEnabled(true);
+        showMapSection();
         await loadResults();
       } else if (data.status === "failed") {
         stopPolling();
@@ -386,6 +433,7 @@ document.addEventListener("DOMContentLoaded", () => {
           showError(data.error || "Scraping failed.");
         }
         setFormEnabled(true);
+        showMapSection();
       } else if (data.status === "stopped") {
         stopPolling();
         stopTimer();
@@ -393,8 +441,24 @@ document.addEventListener("DOMContentLoaded", () => {
         progressSpinner.style.display = "none";
         progressBar.classList.remove("progress-bar-animated");
         setFormEnabled(true);
+        showMapSection();
         if (data.lead_count > 0) {
           await loadResults();
+        }
+      } else {
+        if (Array.isArray(data.results) && data.results.length > 0) {
+          allLeads = data.results;
+          resultCount.textContent = data.results.length;
+          renderLeads(allLeads);
+          showResults();
+        }
+        // Still running — render live partial results
+        if (data.lead_count > 0 && !liveLeadsRendered) {
+          liveLeadsRendered = true;
+          await loadLiveResults();
+        } else if (data.lead_count > (allLeads.length || 0) + 5) {
+          // Refresh every time we have 5+ new leads
+          await loadLiveResults();
         }
       }
     } catch (err) {
@@ -417,6 +481,91 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Load results failed:", err);
     }
   }
+
+  async function loadLiveResults() {
+    try {
+      const res = await fetch(`/api/status/${currentJobId}`);
+      const data = await res.json();
+      if (Array.isArray(data.results) && data.results.length > 0) {
+        allLeads = data.results;
+        resultCount.textContent = data.results.length;
+        renderLeads(allLeads);
+        showResults();
+        return;
+      }
+      if (
+        (data.area_stats && data.area_stats.leads_found > 0) ||
+        data.lead_count > 0
+      ) {
+        // Try loading partial results even during running state
+        try {
+          const rr = await fetch(`/api/results/${currentJobId}`);
+          const rd = await rr.json();
+          if (rd.leads && rd.leads.length > 0) {
+            allLeads = rd.leads;
+            resultCount.textContent = rd.total;
+            renderLeads(allLeads);
+            showResults();
+          }
+        } catch (_) {
+          // Results may not be available yet during RUNNING — that's OK
+        }
+      }
+    } catch (err) {
+      console.error("Live results failed:", err);
+    }
+  }
+
+  // Column sorting
+  function sortLeads(column) {
+    if (sortColumn === column) {
+      sortDirection = sortDirection === "asc" ? "desc" : "asc";
+    } else {
+      sortColumn = column;
+      sortDirection = "asc";
+    }
+
+    const sorted = [...allLeads].sort((a, b) => {
+      let va = a[column] || "";
+      let vb = b[column] || "";
+
+      // Numeric sort for rating/reviews
+      if (column === "rating" || column === "reviews") {
+        va = parseFloat(String(va).replace(/,/g, "")) || 0;
+        vb = parseFloat(String(vb).replace(/,/g, "")) || 0;
+      } else {
+        va = String(va).toLowerCase();
+        vb = String(vb).toLowerCase();
+      }
+
+      if (va < vb) return sortDirection === "asc" ? -1 : 1;
+      if (va > vb) return sortDirection === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    renderLeads(sorted);
+    updateSortIndicators();
+  }
+
+  function updateSortIndicators() {
+    document.querySelectorAll("th[data-sort]").forEach((th) => {
+      const icon = th.querySelector(".sort-icon");
+      if (!icon) return;
+      if (th.dataset.sort === sortColumn) {
+        icon.className = `bi sort-icon ${sortDirection === "asc" ? "bi-caret-up-fill" : "bi-caret-down-fill"}`;
+        icon.style.opacity = "1";
+      } else {
+        icon.className = "bi bi-caret-up sort-icon";
+        icon.style.opacity = "0.3";
+      }
+    });
+  }
+
+  // Attach sort listeners after DOM ready
+  document.querySelectorAll("th[data-sort]").forEach((th) => {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", () => sortLeads(th.dataset.sort));
+  });
 
   // Render
   function renderLeads(leads) {
@@ -464,6 +613,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const socialsHtml = socials.length > 0 ? socials.join("") : "N/A";
 
       const row = document.createElement("tr");
+      row.className = "lead-row";
       row.innerHTML = `
                 <td>${idx + 1}</td>
                 <td class="fw-semibold">${escapeHtml(lead.business_name)}</td>
@@ -490,12 +640,22 @@ document.addEventListener("DOMContentLoaded", () => {
     progressTitle.textContent = "Scraping in progress...";
     progressSpinner.style.display = "";
     if (liveStats) liveStats.style.display = "none";
+    if (coverageBadge) coverageBadge.style.display = "none";
+    if (keywordsExpanded) keywordsExpanded.style.display = "none";
     if (elapsedTimer)
       elapsedTimer.innerHTML = '<i class="bi bi-clock me-1"></i>00:00:00';
   }
 
   function hideProgress() {
     progressSection.style.display = "none";
+  }
+
+  function showMapSection() {
+    if (mapSection) {
+      mapSection.style.display = "";
+      // Invalidate map size after show (Leaflet needs this)
+      if (map) setTimeout(() => map.invalidateSize(), 200);
+    }
   }
 
   function showResults() {

@@ -37,6 +37,12 @@ pip install -r requirements.txt
 ```bash
 # Start the web server
 python app.py
+
+# Or start the complete stack (Redis check + Celery worker + Flask)
+./run_app.sh
+
+# Windows (Command Prompt)
+run_app.bat
 ```
 
 Open your browser to **http://localhost:5000**

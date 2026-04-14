@@ -50,6 +50,18 @@ PHONE_RE = re.compile(
     r"\d{2,4}[\s\-.]?\d{2,4}[\s\-.]?\d{0,4}",
 )
 
+# False-positive phone patterns (dates, zip codes, CSS, etc.)
+PHONE_FALSE_POSITIVES = re.compile(
+    r'^(?:'
+    r'\d{4}[\-/]\d{2}[\-/]\d{2}|'       # dates: 2024-01-15
+    r'\d{2}[\-/]\d{2}[\-/]\d{4}|'       # dates: 01/15/2024
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}|'       # IP-like: 192.168.1
+    r'\d{1,4}px|'                         # CSS: 14px
+    r'\d{1,4}rem|'                        # CSS: 1rem
+    r'\d{5,}$'                           # zip codes / long numbers
+    r')$', re.I
+)
+
 EMAIL_BLACKLIST = {
     "example.com", "test.com", "email.com", "domain.com",
     "yoursite.com", "company.com", "website.com", "sentry.io",
@@ -103,6 +115,8 @@ class WebLead:
     address: str = ""
     description: str = ""
     source: str = ""  # which search/site found this
+    operating_hours: str = ""
+    has_structured_data: str = ""
     facebook: str = ""
     instagram: str = ""
     twitter: str = ""
@@ -563,6 +577,110 @@ class WebCrawlerScraper:
                             meta_desc["content"].strip()[:200]
                         )
 
+                # --- JSON-LD Structured Data Extraction ---
+                for script in soup.find_all(
+                    "script", type="application/ld+json",
+                ):
+                    try:
+                        ld_data = json.loads(script.string or "")
+                        # Handle @graph arrays
+                        items = [ld_data] if isinstance(ld_data, dict) else (
+                            ld_data if isinstance(ld_data, list) else []
+                        )
+                        if isinstance(ld_data, dict) and "@graph" in ld_data:
+                            items = ld_data["@graph"]
+
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            ld_type = str(item.get("@type", "")).lower()
+
+                            # Match LocalBusiness, Organization, etc.
+                            is_biz = any(t in ld_type for t in (
+                                "localbusiness", "organization", "store",
+                                "restaurant", "hotel", "medicalorganization",
+                                "dentist", "physician", "legalservice",
+                                "autodealer", "beautysalon", "barber",
+                            ))
+
+                            if is_biz:
+                                lead.has_structured_data = "Yes"
+
+                                # Business name from LD
+                                if not lead.business_name:
+                                    ld_name = item.get("name", "")
+                                    if ld_name and isinstance(ld_name, str):
+                                        lead.business_name = ld_name[:100]
+
+                                # Phone from LD
+                                ld_phone = item.get("telephone", "")
+                                if ld_phone and isinstance(ld_phone, str):
+                                    phone_clean = re.sub(r"[^\d+\-() ]", "", ld_phone).strip()
+                                    if len(phone_clean) >= 7:
+                                        all_phones.add(phone_clean)
+
+                                # Description from LD
+                                if not lead.description:
+                                    ld_desc = item.get("description", "")
+                                    if ld_desc and isinstance(ld_desc, str):
+                                        lead.description = ld_desc[:200]
+
+                                # Address from LD
+                                if not lead.address:
+                                    addr = item.get("address", {})
+                                    if isinstance(addr, dict):
+                                        parts = [
+                                            addr.get("streetAddress", ""),
+                                            addr.get("addressLocality", ""),
+                                            addr.get("addressRegion", ""),
+                                            addr.get("postalCode", ""),
+                                            addr.get("addressCountry", ""),
+                                        ]
+                                        full = ", ".join(
+                                            p for p in parts if p
+                                        )
+                                        if full:
+                                            lead.address = full[:200]
+
+                                # Operating hours from LD
+                                if not lead.operating_hours:
+                                    hours = item.get("openingHours")
+                                    if hours:
+                                        if isinstance(hours, list):
+                                            lead.operating_hours = "; ".join(
+                                                str(h) for h in hours
+                                            )[:200]
+                                        elif isinstance(hours, str):
+                                            lead.operating_hours = hours[:200]
+                                    # Also check openingHoursSpecification
+                                    hours_spec = item.get("openingHoursSpecification")
+                                    if not lead.operating_hours and hours_spec:
+                                        if isinstance(hours_spec, list):
+                                            parts = []
+                                            for spec in hours_spec[:7]:
+                                                if isinstance(spec, dict):
+                                                    days = spec.get("dayOfWeek", "")
+                                                    if isinstance(days, list):
+                                                        days = ", ".join(
+                                                            str(d).split("/")[-1] for d in days
+                                                        )
+                                                    opens = spec.get("opens", "")
+                                                    closes = spec.get("closes", "")
+                                                    if days and opens:
+                                                        parts.append(f"{days}: {opens}-{closes}")
+                                            if parts:
+                                                lead.operating_hours = "; ".join(parts)[:200]
+
+                                # Email from LD
+                                ld_email = item.get("email", "")
+                                if ld_email and isinstance(ld_email, str):
+                                    ld_email = ld_email.replace("mailto:", "").strip()
+                                    if self._is_valid_email(ld_email):
+                                        all_emails.add(ld_email.lower())
+
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+
                 # Emails from mailto: links
                 for a in soup.find_all("a", href=True):
                     href_val = a["href"]
@@ -585,7 +703,7 @@ class WebCrawlerScraper:
                     if href_val.startswith("tel:"):
                         phone = href_val.replace("tel:", "").strip()
                         phone = re.sub(r"[^\d+\-() ]", "", phone)
-                        if len(phone) >= 7:
+                        if len(phone) >= 7 and not PHONE_FALSE_POSITIVES.match(phone):
                             all_phones.add(phone)
 
                 # Phones from page text (likely sections only)
@@ -601,7 +719,7 @@ class WebCrawlerScraper:
                         cleaned = re.sub(
                             r"[^\d+\-() ]", "", m,
                         ).strip()
-                        if 7 <= len(cleaned) <= 20:
+                        if 7 <= len(cleaned) <= 20 and not PHONE_FALSE_POSITIVES.match(cleaned):
                             all_phones.add(cleaned)
 
                 # Social links
@@ -619,31 +737,6 @@ class WebCrawlerScraper:
                         mt = pattern.search(text)
                         if mt:
                             found_socials[platform] = mt.group(0)
-
-                # Address from structured data
-                if not lead.address:
-                    for script in soup.find_all(
-                        "script", type="application/ld+json",
-                    ):
-                        try:
-                            data = json.loads(script.string or "")
-                            if isinstance(data, dict):
-                                addr = data.get("address", {})
-                                if isinstance(addr, dict):
-                                    parts = [
-                                        addr.get("streetAddress", ""),
-                                        addr.get("addressLocality", ""),
-                                        addr.get("addressRegion", ""),
-                                        addr.get("postalCode", ""),
-                                        addr.get("addressCountry", ""),
-                                    ]
-                                    full = ", ".join(
-                                        p for p in parts if p
-                                    )
-                                    if full:
-                                        lead.address = full[:200]
-                        except Exception:
-                            pass
 
                 # Early exit if we have everything
                 if (all_emails and all_phones
@@ -953,6 +1046,8 @@ def clean_web_leads(leads: list[dict]) -> list[dict]:
             "website": website or "N/A",
             "address": lead.get("address", "N/A") or "N/A",
             "description": lead.get("description", "N/A") or "N/A",
+            "operating_hours": lead.get("operating_hours", "N/A") or "N/A",
+            "has_structured_data": lead.get("has_structured_data", "") or "",
             "source": lead.get("source", "N/A") or "N/A",
             "facebook": lead.get("facebook", "N/A") or "N/A",
             "instagram": lead.get("instagram", "N/A") or "N/A",

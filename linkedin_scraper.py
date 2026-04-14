@@ -45,6 +45,7 @@ class LinkedInProfile:
     profile_url: str = ""
     linkedin_username: str = ""
     snippet: str = ""
+    seniority_level: str = ""
 
 
 @dataclass
@@ -146,6 +147,10 @@ class LinkedInScraper:
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1920,1080")
+        # Anti-detection: randomize window size slightly
+        w = 1920 + random.randint(-100, 100)
+        h = 1080 + random.randint(-50, 50)
+        chrome_options.add_argument(f"--window-size={w},{h}")
         chrome_options.add_argument("--lang=en-US")
         chrome_options.add_argument("--log-level=3")
 
@@ -592,6 +597,34 @@ class LinkedInScraper:
 
         return profile if profile.name else None
 
+    @staticmethod
+    def _classify_seniority(title: str) -> str:
+        """Classify a LinkedIn title into a seniority level."""
+        if not title:
+            return "Other"
+        t = title.lower()
+        if any(k in t for k in (
+            'ceo', 'chief', 'cto', 'cfo', 'coo', 'cmo', 'cio',
+            'founder', 'co-founder', 'cofounder', 'president',
+            'chairman', 'chairwoman', 'chairperson',
+        )):
+            return "C-Suite"
+        if any(k in t for k in ('vice president', 'vp', 'svp', 'evp')):
+            return "VP"
+        if any(k in t for k in ('director', 'managing director', 'head of')):
+            return "Director"
+        if any(k in t for k in ('manager', 'team lead', 'lead', 'supervisor')):
+            return "Manager"
+        if any(k in t for k in ('senior', 'sr.', 'principal', 'staff')):
+            return "Senior"
+        if any(k in t for k in ('partner', 'owner', 'proprietor')):
+            return "Partner/Owner"
+        if any(k in t for k in ('associate', 'analyst', 'coordinator', 'executive')):
+            return "Mid-Level"
+        if any(k in t for k in ('intern', 'trainee', 'junior', 'jr.', 'assistant')):
+            return "Entry Level"
+        return "Other"
+
     # ---- Company parsing -----------------------------------------------
 
     def _parse_company_from_serp(
@@ -804,6 +837,11 @@ class LinkedInScraper:
                     parsed = self._parse_company_from_serp(result)
 
                 if parsed:
+                    # Add seniority for profiles
+                    if search_type == "profiles" and hasattr(parsed, 'seniority_level'):
+                        parsed.seniority_level = self._classify_seniority(
+                            parsed.title
+                        )
                     lead_dict = asdict(parsed)
                     leads.append(lead_dict)
                     self._partial_leads.append(lead_dict)
@@ -861,6 +899,7 @@ def clean_linkedin_leads(
             cleaned.append({
                 "name": name,
                 "title": lead.get("title", "N/A") or "N/A",
+                "seniority_level": lead.get("seniority_level", "N/A") or "N/A",
                 "company": lead.get("company", "N/A") or "N/A",
                 "location": lead.get("location", "N/A") or "N/A",
                 "profile_url": key or "N/A",

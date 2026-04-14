@@ -199,6 +199,8 @@ class InstagramLead:
     category: str = ""
     followers: str = ""
     location: str = ""
+    is_verified: str = ""
+    post_count: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +830,26 @@ class InstagramScraper:
                     data.setdefault("email", em.lower())
                     break
 
+            # --- Verified badge ---
+            verified_m = re.search(r'"is_verified"\s*:\s*(true|false)', html, re.I)
+            if verified_m:
+                data["is_verified"] = "Yes" if verified_m.group(1).lower() == "true" else ""
+
+            # --- Post count ---
+            # From og:description: "X Followers, Y Following, Z Posts"
+            if og_desc and og_desc.get("content"):
+                post_m = re.search(r'([\d,.KMkm]+)\s*Posts', og_desc["content"], re.I)
+                if post_m:
+                    data["post_count"] = post_m.group(1)
+            # From JSON
+            if not data.get("post_count"):
+                pc_m = re.search(
+                    r'"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                    html,
+                )
+                if pc_m:
+                    data["post_count"] = pc_m.group(1)
+
         except Exception as e:
             logger.debug(f"Enrichment failed for @{username}: {e}")
 
@@ -852,6 +874,10 @@ class InstagramScraper:
             not lead.get("display_name") or lead["display_name"] == "N/A"
         ):
             lead["display_name"] = enrichment["display_name"]
+        if enrichment.get("is_verified"):
+            lead["is_verified"] = enrichment["is_verified"]
+        if enrichment.get("post_count"):
+            lead["post_count"] = enrichment["post_count"]
 
     def _enrich_profiles(
         self,
@@ -1311,6 +1337,8 @@ def clean_instagram_leads(
             "category": lead.get("category", "N/A") or "N/A",
             "followers": lead.get("followers", "N/A") or "N/A",
             "location": lead.get("location", "N/A") or "N/A",
+            "is_verified": lead.get("is_verified", "") or "",
+            "post_count": lead.get("post_count", "N/A") or "N/A",
         })
 
     return cleaned
