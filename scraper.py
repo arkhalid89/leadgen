@@ -122,8 +122,8 @@ class GoogleMapsScraper:
         self._progress_callback = None
         self._should_stop = False
         self._website_workers = max(1, int(os.environ.get("LEADGEN_WEBSITE_WORKERS", "20")))
-        self._website_timeout_seconds = max(2.0, float(os.environ.get("LEADGEN_WEBSITE_TIMEOUT_SECONDS", "8")))
-        self._max_pages_per_website = max(1, int(os.environ.get("LEADGEN_WEBSITE_MAX_PAGES", "3")))
+        self._website_timeout_seconds = max(2.0, float(os.environ.get("LEADGEN_WEBSITE_TIMEOUT_SECONDS", "15")))
+        self._max_pages_per_website = max(1, int(os.environ.get("LEADGEN_WEBSITE_MAX_PAGES", "8")))
         self._max_scroll_attempts = max(30, int(os.environ.get("LEADGEN_SCROLL_ATTEMPTS", "120")))
         # Shared HTTP adapter for connection-pool reuse across parallel workers
         self._http_adapter = requests.adapters.HTTPAdapter(
@@ -1153,7 +1153,21 @@ class GoogleMapsScraper:
         return [asdict(l) for l in lead_objs]
 
     def _scrape_website(self, lead: BusinessLead):
-        """Visit a business website to extract emails and social profiles."""
+        """Visit a business website to extract emails and social profiles.
+
+        Email is the highest-priority extraction target.  Strategy:
+          1. mailto: links  (highest confidence)
+          2. JSON-LD / schema.org structured data
+          3. Raw HTML regex scan  (catches visible + hidden text)
+          4. Visible text regex scan  (after HTML→text conversion)
+          5. HTML-entity-decoded text  (catches &#64; obfuscation)
+          6. <footer> / role=contentinfo email scan
+          7. Hidden inputs, meta tags, inline <script> blocks
+          8. Domain-based pattern guessing (last resort: info@, contact@, ...)
+
+        The crawler prioritises contact-oriented pages and will NOT
+        short-circuit while emails are still missing.
+        """
         url = lead.website
         if not url or url == "N/A":
             return
@@ -1161,12 +1175,19 @@ class GoogleMapsScraper:
         if not url.startswith("http"):
             url = "https://" + url
 
-        # Pages to check: homepage + high-signal contact/about slugs
+        # Ordered: email-heavy pages first, informational pages later
         candidate_paths = [
-            "", "/contact", "/contact-us", "/contactus", "/get-in-touch",
-            "/reach-us", "/support", "/help", "/about", "/about-us",
-            "/who-we-are", "/our-team", "/team", "/company", "/about/company",
-            "/about/team", "/connect",
+            "",
+            # -- High email signal --
+            "/contact", "/contact-us", "/contactus", "/get-in-touch",
+            "/reach-us", "/connect", "/enquiry", "/inquiry",
+            # -- Medium email signal --
+            "/support", "/help", "/customer-service",
+            # -- Informational --
+            "/about", "/about-us", "/who-we-are", "/our-team",
+            "/team", "/company", "/about/company", "/about/team",
+            # -- Footer / legal (sometimes contain emails) --
+            "/privacy-policy", "/imprint", "/impressum",
         ]
 
         pages_to_check: deque[str] = deque()
@@ -1177,33 +1198,31 @@ class GoogleMapsScraper:
                 pages_to_check.append(page)
                 seen_pages.add(page)
 
-        all_emails = set()
-        all_phones = set()
-        found_socials = {k: "" for k in SOCIAL_PATTERNS}
+        all_emails: set[str] = set()
+        all_phones: set[str] = set()
+        found_socials: dict[str, str] = {k: "" for k in SOCIAL_PATTERNS}
         deadline = time.monotonic() + self._website_timeout_seconds
         session = self._new_http_session()
         homepage_reachable = False
         pages_checked = 0
+        site_domain = urlparse(url).netloc.lower()  # for email guessing
 
         while pages_to_check and pages_checked < self._max_pages_per_website:
             if self._should_stop:
                 break
             page_url = pages_to_check.popleft()
 
-            # Hard deadline check at top to avoid wasted future.result() timeout
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
 
             try:
-                # 1.5s connect (fail fast on dead hosts), 3s read max per page
-                read_timeout = min(3.0, max(1.0, remaining))
+                read_timeout = min(4.0, max(1.5, remaining))
                 resp = session.get(
                     page_url,
-                    timeout=(1.5, read_timeout),
+                    timeout=(2.0, read_timeout),
                     allow_redirects=True,
                 )
-                # Skip client errors (404) and server errors (5xx) immediately
                 if resp.status_code >= 400:
                     continue
 
@@ -1217,27 +1236,131 @@ class GoogleMapsScraper:
                 soup = BeautifulSoup(text, "lxml")
                 text_content = soup.get_text(" ", strip=True)
 
-                # ---- Extract Emails ----
+                # ========================================================
+                # EMAIL EXTRACTION — multi-layer strategy
+                # ========================================================
+
+                # Layer 1: mailto: links (highest confidence)
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
-                    if href.startswith("mailto:"):
-                        email = href.replace("mailto:", "").split("?")[0].strip()
+                    if href.lower().startswith("mailto:"):
+                        email = href[7:].split("?")[0].split("#")[0].strip()
                         if self._is_valid_email(email):
                             all_emails.add(email.lower())
 
+                # Layer 2: JSON-LD structured data emails
+                for script in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        import json as _json
+                        ld = _json.loads(script.string or "")
+                        items = [ld] if isinstance(ld, dict) else (ld if isinstance(ld, list) else [])
+                        if isinstance(ld, dict) and "@graph" in ld:
+                            items = ld["@graph"]
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            for key in ("email", "contactPoint"):
+                                val = item.get(key)
+                                if isinstance(val, str):
+                                    em = val.replace("mailto:", "").strip()
+                                    if self._is_valid_email(em):
+                                        all_emails.add(em.lower())
+                                elif isinstance(val, dict):
+                                    em = (val.get("email") or "").replace("mailto:", "").strip()
+                                    if self._is_valid_email(em):
+                                        all_emails.add(em.lower())
+                                elif isinstance(val, list):
+                                    for cp in val:
+                                        if isinstance(cp, dict):
+                                            em = (cp.get("email") or "").replace("mailto:", "").strip()
+                                            if self._is_valid_email(em):
+                                                all_emails.add(em.lower())
+                    except Exception:
+                        pass
+
+                # Layer 3: Raw HTML regex scan (catches hidden / JS-embedded)
                 for match in EMAIL_RE.findall(text):
                     if self._is_valid_email(match):
                         all_emails.add(match.lower())
 
+                # Layer 4: Visible text regex scan
                 for match in EMAIL_RE.findall(text_content):
                     if self._is_valid_email(match):
                         all_emails.add(match.lower())
 
-                # ---- Extract Phones ----
+                # Layer 5: HTML-entity-decoded text (catches &#64; / &#x40; obfuscation)
+                try:
+                    import html as _html_mod
+                    decoded_text = _html_mod.unescape(text)
+                    if decoded_text != text:
+                        for match in EMAIL_RE.findall(decoded_text):
+                            if self._is_valid_email(match):
+                                all_emails.add(match.lower())
+                except Exception:
+                    pass
+
+                # Layer 6: Footer-specific extraction
+                for footer in soup.find_all(["footer"]):
+                    footer_text = footer.get_text(" ", strip=True)
+                    for match in EMAIL_RE.findall(footer_text):
+                        if self._is_valid_email(match):
+                            all_emails.add(match.lower())
+                    for a in footer.find_all("a", href=True):
+                        href = a["href"]
+                        if href.lower().startswith("mailto:"):
+                            em = href[7:].split("?")[0].strip()
+                            if self._is_valid_email(em):
+                                all_emails.add(em.lower())
+                # Also check elements with role="contentinfo"
+                for el in soup.find_all(attrs={"role": "contentinfo"}):
+                    for match in EMAIL_RE.findall(el.get_text(" ", strip=True)):
+                        if self._is_valid_email(match):
+                            all_emails.add(match.lower())
+
+                # Layer 7: Hidden inputs, meta tags, data-attributes
+                for inp in soup.find_all("input", attrs={"type": "hidden"}):
+                    val = (inp.get("value") or "").strip()
+                    if "@" in val and self._is_valid_email(val):
+                        all_emails.add(val.lower())
+                for meta in soup.find_all("meta"):
+                    content = (meta.get("content") or "").strip()
+                    if "@" in content:
+                        for match in EMAIL_RE.findall(content):
+                            if self._is_valid_email(match):
+                                all_emails.add(match.lower())
+                # data-email / data-href attributes
+                for el in soup.find_all(attrs={"data-email": True}):
+                    em = (el["data-email"] or "").strip()
+                    if self._is_valid_email(em):
+                        all_emails.add(em.lower())
+                for el in soup.find_all(attrs={"data-href": True}):
+                    val = (el["data-href"] or "").strip()
+                    if val.lower().startswith("mailto:"):
+                        em = val[7:].split("?")[0].strip()
+                        if self._is_valid_email(em):
+                            all_emails.add(em.lower())
+
+                # Layer 8: Inline <script> blocks (JS string literals)
+                for script in soup.find_all("script"):
+                    if script.get("type") and script["type"] not in (
+                        "text/javascript", "application/javascript", "",
+                    ):
+                        continue  # skip ld+json etc (already handled)
+                    js_text = script.string or ""
+                    if "@" in js_text:
+                        for match in EMAIL_RE.findall(js_text):
+                            if self._is_valid_email(match):
+                                all_emails.add(match.lower())
+
+                # ========================================================
+                # PHONE EXTRACTION
+                # ========================================================
                 for phone in self._extract_phones(text_content):
                     all_phones.add(phone)
 
-                # ---- Extract Social Links ----
+                # ========================================================
+                # SOCIAL LINKS EXTRACTION
+                # ========================================================
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
                     for platform, pattern in SOCIAL_PATTERNS.items():
@@ -1252,7 +1375,9 @@ class GoogleMapsScraper:
                         if m:
                             found_socials[platform] = m.group(0)
 
-                # ---- Discover internal high-signal links ----
+                # ========================================================
+                # DISCOVER internal high-signal links for further crawling
+                # ========================================================
                 parsed_base = urlparse(url)
                 for a in soup.find_all("a", href=True):
                     href = (a.get("href") or "").strip()
@@ -1268,16 +1393,18 @@ class GoogleMapsScraper:
                     if any(token in path_l for token in [
                         "contact", "about", "team", "company", "support",
                         "connect", "help", "who-we-are", "our-story",
+                        "enquiry", "inquiry", "reach", "email",
                     ]):
                         if abs_url not in seen_pages:
                             seen_pages.add(abs_url)
                             pages_to_check.append(abs_url)
 
+                # Early exit ONLY if we have emails AND everything else.
+                # Never skip pages just because we have phones/socials — email is king.
                 if all_emails and all_phones and all(found_socials.values()):
                     break
 
-            except (requests.ConnectionError, requests.Timeout) as e:
-                # Host is unreachable or too slow — skip ALL pages for this domain
+            except (requests.ConnectionError, requests.Timeout):
                 if not homepage_reachable:
                     logger.debug(f"Unreachable: {url} — skipping")
                     break
@@ -1291,9 +1418,32 @@ class GoogleMapsScraper:
                 if time.monotonic() >= deadline:
                     break
 
+        # ========================================================
+        # LAST RESORT: Domain-based email pattern guessing
+        # ========================================================
+        # Only if we reached the site but found zero emails.
+        # Adds a single info@<domain> guess for custom-domain sites.
+        if not all_emails and homepage_reachable:
+            # Strip 'www.' to get root domain
+            guess_domain = site_domain
+            if guess_domain.startswith("www."):
+                guess_domain = guess_domain[4:]
+            # Don't guess for generic hosting / platform domains
+            _no_guess_domains = {
+                "wix.com", "squarespace.com", "wordpress.com", "shopify.com",
+                "weebly.com", "godaddy.com", "sites.google.com", "blogspot.com",
+                "tumblr.com", "medium.com", "carrd.co", "webflow.io",
+                "wixsite.com", "netlify.app", "vercel.app", "herokuapp.com",
+            }
+            if guess_domain and not any(guess_domain.endswith(d) for d in _no_guess_domains):
+                # Use "info@" as the most universally common business email prefix
+                all_emails.add(f"info@{guess_domain}")
+
         session.close()
 
-        # Assign to lead
+        # ========================================================
+        # ASSIGN results to lead
+        # ========================================================
         if all_emails:
             lead.email = "; ".join(sorted(all_emails))
 

@@ -2609,13 +2609,37 @@ def _run_scrape_in_thread(job_id: str, payload: dict):
             payload={"results_count": len(final_leads)},
         )
 
-        # SSE: notify extraction complete
-        _sse_publish(job_id, "job_completed", {
-            "status": final_status,
-            "total_leads": len(final_leads),
-            "phase": "extract",
-            "message": final_state["message"],
-        })
+        # ================================================================
+        # AUTO-CHAIN: extract → contacts (inline email/social enrichment)
+        # ================================================================
+        # If extraction completed fully and we have leads with websites,
+        # automatically start contact retrieval in the SAME thread so
+        # emails stream into the table in real time.
+        has_websites = any(
+            (lead.get("website") or "") not in ("", "N/A")
+            for lead in final_leads
+        )
+
+        if final_status == "COMPLETED" and final_leads and has_websites and not (should_stop and should_stop()):
+            # SSE: tell the frontend extraction is done, contacts starting
+            _sse_publish(job_id, "phase_transition", {
+                "from_phase": "extract",
+                "to_phase": "contacts",
+                "total_leads": len(final_leads),
+                "message": f"List extraction complete ({len(final_leads)} leads). Starting email & social retrieval...",
+            })
+
+            # Run contact retrieval directly in this thread (no queue hop)
+            log.info(f"Job {job_id}: auto-chaining extract → contacts for {len(final_leads)} leads")
+            _run_contact_retrieval_thread(job_id)
+        else:
+            # Extraction was partial / stopped / no websites → just notify completion
+            _sse_publish(job_id, "job_completed", {
+                "status": final_status,
+                "total_leads": len(final_leads),
+                "phase": "extract",
+                "message": final_state["message"],
+            })
 
     except Exception as exc:
         log.error(f"Scrape job {job_id} failed: {exc}")
@@ -2751,6 +2775,11 @@ def _run_contact_retrieval_thread(job_id: str):
             chunk_index = int(chunk.get("chunk_index") or 1)
             chunk_key = str(chunk.get("chunk_key") or "")
             chunk_leads = chunk.get("leads") if isinstance(chunk.get("leads"), list) else []
+            # Global offset so SSE lead_index matches the frontend's allLeads[] array
+            chunk_global_offset = sum(
+                len(c.get("leads") or [])
+                for c in chunk_plan[:chunk_index - 1]
+            )
             if not chunk_key:
                 continue
 
@@ -2816,13 +2845,15 @@ def _run_contact_retrieval_thread(job_id: str):
 
             def _on_contact_found(lead_index: int, enriched_lead: dict):
                 """SSE hook: push per-lead contact enrichment to the browser."""
+                # The scraper sends socials nested: {email, phone, socials: {fb, ig, ...}}
+                raw_socials = enriched_lead.get("socials") if isinstance(enriched_lead.get("socials"), dict) else {}
                 _sse_publish(job_id, "contact_found", {
-                    "lead_index": lead_index,
+                    "lead_index": chunk_global_offset + lead_index,
                     "business_name": enriched_lead.get("business_name", ""),
-                    "email": enriched_lead.get("email", "N/A"),
-                    "phone": enriched_lead.get("phone", "N/A"),
+                    "email": enriched_lead.get("email", "") or "N/A",
+                    "phone": enriched_lead.get("phone", "") or "N/A",
                     "socials": {
-                        k: enriched_lead.get(k, "N/A")
+                        k: raw_socials.get(k, "") or enriched_lead.get(k, "") or "N/A"
                         for k in ("facebook", "instagram", "twitter", "linkedin", "youtube", "tiktok", "pinterest")
                     },
                 })

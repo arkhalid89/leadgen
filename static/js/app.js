@@ -82,6 +82,12 @@ document.addEventListener("DOMContentLoaded", () => {
   let timerInterval = null;
   let timerStartTime = null;
 
+  function setElementVisible(element, visible, displayValue = "") {
+    if (!element) return;
+    element.classList.toggle("is-hidden", !visible);
+    element.style.display = visible ? displayValue : "none";
+  }
+
   function startTimer() {
     timerStartTime = Date.now();
     timerInterval = setInterval(() => {
@@ -131,7 +137,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const completedCells =
       data.completed_cells || as.geo_cells_completed || as.completed_areas || 0;
     const leadCount =
-      data.results_count || data.lead_count || as.leads_found || allLeads.length || 0;
+      data.results_count ||
+      data.lead_count ||
+      as.leads_found ||
+      allLeads.length ||
+      0;
 
     if (totalCells > 0) {
       statAreas.textContent = `${completedCells} / ${totalCells}`;
@@ -188,7 +198,7 @@ document.addEventListener("DOMContentLoaded", () => {
         cls = "bg-danger";
       }
       coverageBadge.innerHTML = `<span class="badge ${cls}">Coverage: ${score}% (${label})</span>`;
-      coverageBadge.style.display = "";
+      setElementVisible(coverageBadge, true);
     }
 
     // Keywords expanded
@@ -198,7 +208,7 @@ document.addEventListener("DOMContentLoaded", () => {
       as.keywords_expanded.length > 1
     ) {
       keywordsExpanded.innerHTML = `<small class="text-muted"><i class="bi bi-tags me-1"></i>Keywords: ${as.keywords_expanded.join(", ")}</small>`;
-      keywordsExpanded.style.display = "";
+      setElementVisible(keywordsExpanded, true);
     }
   }
 
@@ -435,12 +445,15 @@ document.addEventListener("DOMContentLoaded", () => {
       // Update live speed calculation from lead count
       if (timerStartTime && d.results_count > 0) {
         const elapsedSec = (Date.now() - timerStartTime) / 1000;
-        const speed = elapsedSec > 10 ? ((d.results_count / elapsedSec) * 60) : 0;
-        if (statSpeed) statSpeed.textContent = speed > 0 ? speed.toFixed(1) : "—";
+        const speed = elapsedSec > 10 ? (d.results_count / elapsedSec) * 60 : 0;
+        if (statSpeed)
+          statSpeed.textContent = speed > 0 ? speed.toFixed(1) : "—";
 
         // ETA
         if (statETA && d.percent > 5 && d.percent < 100) {
-          const etaSec = Math.round((elapsedSec / d.percent) * (100 - d.percent));
+          const etaSec = Math.round(
+            (elapsedSec / d.percent) * (100 - d.percent),
+          );
           const m = Math.floor(etaSec / 60);
           const s = etaSec % 60;
           statETA.textContent = m > 0 ? `~${m}m ${s}s` : `~${s}s`;
@@ -469,12 +482,31 @@ document.addEventListener("DOMContentLoaded", () => {
       appendLeadRow(lead, index);
     });
 
+    // ── phase_transition ── (extraction → contacts auto-chain)
+    eventSource.addEventListener("phase_transition", (e) => {
+      const d = JSON.parse(e.data);
+      if (d.to_phase === "contacts") {
+        latestPhase = "contacts";
+        latestContactsStatus = "running";
+        progressTitle.textContent =
+          "Extracting emails & social profiles...";
+        if (btnStartContacts) setElementVisible(btnStartContacts, false);
+        appendLog(d.message || "Starting contact retrieval...", null);
+        // Keep SSE stream open — do NOT call stopStream()
+        // Show websites stat
+        if (statWebsitesWrap) {
+          statWebsitesWrap.style.display = "";
+          statWebsitesWrap.classList.remove("is-hidden");
+        }
+      }
+    });
+
     // ── crawl_started ── (contacts phase begins for a chunk)
     eventSource.addEventListener("crawl_started", (e) => {
       const d = JSON.parse(e.data);
       latestPhase = "contacts";
       progressTitle.textContent = "Contact retrieval in progress...";
-      if (btnStartContacts) btnStartContacts.style.display = "none";
+      if (btnStartContacts) setElementVisible(btnStartContacts, false);
       appendLog(
         `Crawling websites: chunk ${d.chunk_index}/${d.total_chunks} (${d.lead_count} leads)`,
         null,
@@ -491,20 +523,44 @@ document.addEventListener("DOMContentLoaded", () => {
     eventSource.addEventListener("contact_found", (e) => {
       const d = JSON.parse(e.data);
       const idx = d.lead_index;
+      const normalizedEmail = normalizeEmailValue(d.email);
 
       // Update the lead in allLeads
       if (allLeads[idx]) {
-        if (d.email && d.email !== "N/A") allLeads[idx].email = d.email;
+        if (normalizedEmail) allLeads[idx].email = normalizedEmail;
         if (d.phone && d.phone !== "N/A") allLeads[idx].phone = d.phone;
         if (d.socials) {
           for (const [k, v] of Object.entries(d.socials)) {
             if (v && v !== "N/A") allLeads[idx][k] = v;
           }
         }
+      } else if (d.business_name) {
+        const matchIndex = allLeads.findIndex(
+          (lead) =>
+            String(lead?.business_name || "")
+              .trim()
+              .toLowerCase() ===
+            String(d.business_name || "")
+              .trim()
+              .toLowerCase(),
+        );
+        if (matchIndex >= 0) {
+          if (normalizedEmail) allLeads[matchIndex].email = normalizedEmail;
+          if (d.phone && d.phone !== "N/A")
+            allLeads[matchIndex].phone = d.phone;
+          if (d.socials) {
+            for (const [k, v] of Object.entries(d.socials)) {
+              if (v && v !== "N/A") allLeads[matchIndex][k] = v;
+            }
+          }
+        }
       }
 
       // Update the specific row in the DOM (not full re-render)
-      updateRowContacts(idx, d);
+      updateRowContacts(idx, {
+        ...d,
+        email: normalizedEmail || d.email,
+      });
     });
 
     // ── job_completed ── (terminal event)
@@ -531,9 +587,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
       // Show contact retrieval button if extraction just finished
       if (phase === "extract" && btnStartContacts) {
-        btnStartContacts.style.display = "";
+        setElementVisible(btnStartContacts, true);
       } else if (btnStartContacts) {
-        btnStartContacts.style.display = "none";
+        setElementVisible(btnStartContacts, false);
       }
       if (phaseIndicator) phaseIndicator.style.display = "none";
       updateExecutionMode({ execution_mode: "cloud" });
@@ -614,20 +670,61 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  function hasUsableValue(value) {
+    if (value === null || value === undefined) return false;
+    const text = String(value).trim();
+    if (!text) return false;
+    return text.toUpperCase() !== "N/A";
+  }
+
+  function normalizeEmailValue(value) {
+    if (Array.isArray(value)) {
+      const emails = value
+        .map((v) => String(v || "").trim())
+        .filter((v) => hasUsableValue(v));
+      return emails.length > 0 ? emails.join("; ") : "";
+    }
+    if (!hasUsableValue(value)) return "";
+    return String(value).trim();
+  }
+
+  function findRowForContactUpdate(index, data) {
+    const byIndex = resultsBody.querySelector(`tr[data-lead-index="${index}"]`);
+    if (byIndex) return byIndex;
+
+    const name = String(data?.business_name || "")
+      .trim()
+      .toLowerCase();
+    if (!name) return null;
+
+    const rows = resultsBody.querySelectorAll("tr[data-lead-index]");
+    for (const row of rows) {
+      const businessCell = row.children?.[1];
+      const rowName = String(businessCell?.textContent || "")
+        .trim()
+        .toLowerCase();
+      if (rowName && rowName === name) {
+        return row;
+      }
+    }
+    return null;
+  }
+
   /**
    * Update an existing row's contact fields (email, phone, socials)
    * with a green flash animation. Called per `contact_found` event.
    */
   function updateRowContacts(index, data) {
-    const row = resultsBody.querySelector(`tr[data-lead-index="${index}"]`);
+    const row = findRowForContactUpdate(index, data);
     if (!row) return;
 
     row.dataset.state = "enriched";
 
     // Update email cell
     const emailCell = row.querySelector(".cell-email");
-    if (emailCell && data.email && data.email !== "N/A") {
-      const emailLink = `<a href="mailto:${escapeHtml(data.email.split(";")[0].trim())}">${escapeHtml(truncate(data.email, 28))}</a>`;
+    const emailValue = normalizeEmailValue(data.email);
+    if (emailCell && emailValue) {
+      const emailLink = `<a href="mailto:${escapeHtml(emailValue.split(";")[0].trim())}">${escapeHtml(truncate(emailValue, 28))}</a>`;
       emailCell.innerHTML = emailLink;
       emailCell.classList.add("contact-found-flash");
       setTimeout(() => emailCell.classList.remove("contact-found-flash"), 1500);
@@ -646,7 +743,10 @@ document.addEventListener("DOMContentLoaded", () => {
       if (socialsHtml !== "N/A") {
         socialsCell.innerHTML = socialsHtml;
         socialsCell.classList.add("contact-found-flash");
-        setTimeout(() => socialsCell.classList.remove("contact-found-flash"), 1500);
+        setTimeout(
+          () => socialsCell.classList.remove("contact-found-flash"),
+          1500,
+        );
       }
     }
   }
@@ -814,11 +914,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Reconnect SSE stream
         startStream(saved.job_id);
-
-      } else if (
-        data.status === "completed" ||
-        data.status === "stopped"
-      ) {
+      } else if (data.status === "completed" || data.status === "stopped") {
         // Job finished while we were away — show final results
         showProgress();
         progressTitle.textContent =
@@ -841,7 +937,7 @@ document.addEventListener("DOMContentLoaded", () => {
           data.lead_count > 0 &&
           btnStartContacts
         ) {
-          btnStartContacts.style.display = "";
+          setElementVisible(btnStartContacts, true);
         }
 
         clearPersistedSession();
@@ -1067,7 +1163,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Pause/resume polling on tab visibility
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && currentJobId && !pollTimeout && !eventSource) {
+    if (
+      document.visibilityState === "visible" &&
+      currentJobId &&
+      !pollTimeout &&
+      !eventSource
+    ) {
       schedulePoll();
     }
   });
@@ -1111,9 +1212,9 @@ document.addEventListener("DOMContentLoaded", () => {
         hideResultsSkeleton();
         await loadResults();
         if (latestContactsStatus === "pending" && btnStartContacts) {
-          btnStartContacts.style.display = "";
+          setElementVisible(btnStartContacts, true);
         } else if (btnStartContacts) {
-          btnStartContacts.style.display = "none";
+          setElementVisible(btnStartContacts, false);
         }
         if (phaseIndicator) phaseIndicator.style.display = "none";
         updateExecutionMode({ execution_mode: "cloud" });
@@ -1149,14 +1250,14 @@ document.addEventListener("DOMContentLoaded", () => {
         hideResultsSkeleton();
         if (data.lead_count > 0) {
           await loadResults();
-          if (btnStartContacts) btnStartContacts.style.display = "";
+          if (btnStartContacts) setElementVisible(btnStartContacts, true);
         }
         if (phaseIndicator) phaseIndicator.style.display = "none";
         updateExecutionMode({ execution_mode: "cloud" });
       } else {
         if (latestPhase === "contacts") {
           progressTitle.textContent = "Contact retrieval in progress...";
-          if (btnStartContacts) btnStartContacts.style.display = "none";
+          if (btnStartContacts) setElementVisible(btnStartContacts, false);
         } else {
           progressTitle.textContent = "List extraction in progress...";
         }
@@ -1177,10 +1278,11 @@ document.addEventListener("DOMContentLoaded", () => {
   function updateExecutionMode(data) {
     const badge = document.getElementById("executionModeBadge");
     if (!badge) return;
-    const isLocal = data.execution_mode === "local" || data.execution_mode === "running_local";
+    const isLocal =
+      data.execution_mode === "local" ||
+      data.execution_mode === "running_local";
     badge.style.display = isLocal ? "inline-flex" : "none";
   }
-
 
   async function loadResults() {
     try {
@@ -1251,7 +1353,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ── UI Helpers ──
   function showProgress() {
-    progressSection.style.display = "";
+    setElementVisible(progressSection, true);
     progressBar.style.width = "0%";
     progressBar.classList.add("progress-bar-animated");
     progressBar.classList.remove("progress-bar-complete");
@@ -1260,8 +1362,8 @@ document.addEventListener("DOMContentLoaded", () => {
     progressTitle.textContent = "Scraping in progress...";
     updateStateDot("running");
     if (liveStats) liveStats.style.display = "none";
-    if (coverageBadge) coverageBadge.style.display = "none";
-    if (keywordsExpanded) keywordsExpanded.style.display = "none";
+    setElementVisible(coverageBadge, false);
+    setElementVisible(keywordsExpanded, false);
     if (elapsedTimer)
       elapsedTimer.innerHTML = '<i class="bi bi-clock me-1"></i>00:00:00';
     if (progressLogs) progressLogs.innerHTML = "";
@@ -1274,7 +1376,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function hideProgress() {
-    progressSection.style.display = "none";
+    setElementVisible(progressSection, false);
   }
 
   function showMapSection() {
@@ -1286,11 +1388,11 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function showResults() {
-    resultsSection.style.display = "";
+    setElementVisible(resultsSection, true);
   }
 
   function hideResults() {
-    resultsSection.style.display = "none";
+    setElementVisible(resultsSection, false);
     resultsBody.innerHTML = "";
     allLeads = [];
     filterInput.value = "";
@@ -1307,12 +1409,12 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function showError(msg) {
-    errorSection.style.display = "";
+    setElementVisible(errorSection, true);
     errorMessage.textContent = msg;
   }
 
   function hideError() {
-    errorSection.style.display = "none";
+    setElementVisible(errorSection, false);
   }
 
   function setFormEnabled(enabled) {
@@ -1330,10 +1432,13 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function updateProgress(pct, msg) {
-    progressBar.style.width = `${pct}%`;
-    progressMessage.textContent = msg;
+    const safePct = Number.isFinite(Number(pct))
+      ? Math.max(0, Math.min(100, Number(pct)))
+      : 0;
+    progressBar.style.width = `${safePct}%`;
+    progressMessage.textContent = msg || "Processing...";
     if (progressPercent) {
-      progressPercent.textContent = `${Math.round(pct)}%`;
+      progressPercent.textContent = `${Math.round(safePct)}%`;
     }
   }
 
