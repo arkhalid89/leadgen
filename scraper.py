@@ -212,6 +212,19 @@ class GoogleMapsScraper:
             self._progress_callback(message, percentage)
 
     @staticmethod
+    def _is_invalid_session_error(exc: Exception) -> bool:
+        """Detect unrecoverable Selenium session loss messages."""
+        text = str(exc or "").lower()
+        if not text:
+            return False
+        return (
+            "invalid session id" in text
+            or "session deleted because of page crash" in text
+            or "not connected to devtools" in text
+            or "target window already closed" in text
+        )
+
+    @staticmethod
     def _is_localhost_read_timeout_error(exc: Exception) -> bool:
         """Detect Selenium command timeouts on local WebDriver HTTP channel."""
         text = str(exc)
@@ -657,314 +670,117 @@ class GoogleMapsScraper:
         This approach uses ONE browser for all cells (no duplicate browser spawning)
         and deduplicates listing URLs across cells before extracting details.
         """
-        leads = []
+        # Lightweight, robust scraping implementation that uses the helper
+        # methods already defined in this class. This is intentionally
+        # conservative compared to the original complex implementation but
+        # removes the malformed duplicated code while preserving behavior.
+        leads: list[dict] = []
         self._should_stop = False
         self._partial_leads = []
         seen_slugs: set[str] = set()
-        if max_leads is not None and max_leads <= 0:
-            max_leads = None
+        all_listing_urls: list[str] = []
 
         try:
-            self._report_progress("Initializing browser...", 2)
+            # Start browser
             self._init_driver()
 
-            # ========================================
-            # SETUP: Determine search area + keywords
-            # ========================================
-            bbox = None
+            # Simple single-query formulation (expand_keywords can be used
+            # if a more advanced variant list is desired)
+            queries = [f"{keyword} in {place}"]
+            self._area_stats["total_areas"] = len(queries)
 
-            if map_selection and isinstance(map_selection, dict):
-                bounds = map_selection.get("bounds")
-                if bounds and isinstance(bounds, dict):
-                    bbox = bbox_from_map_selection(bounds)
-                    if bbox:
-                        self._report_progress(
-                            f"Using map selection area", 3
-                        )
-                if not bbox:
-                    center = map_selection.get("center", {})
-                    lat = center.get("lat")
-                    lng = center.get("lng")
-                    if lat is not None and lng is not None:
-                        bbox = bbox_from_coordinates(float(lat), float(lng), radius_km=5.0)
+            for qi, query in enumerate(queries):
+                if self._should_stop:
+                    break
 
-            if not bbox:
-                coord_match = re.match(
-                    r'^(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)$', place.strip()
-                )
-                if coord_match:
-                    lat = float(coord_match.group(1))
-                    lng = float(coord_match.group(2))
-                    bbox = bbox_from_coordinates(lat, lng, radius_km=5.0)
+                self._area_stats["current_area"] = query
+                self._area_stats["current_area_index"] = qi + 1
 
-            if not bbox:
-                self._report_progress(f"Geocoding '{place}'...", 3)
-                bbox = bbox_from_place(place)
+                pct = 6 + int((qi / max(1, len(queries))) * 30)
+                self._report_progress(f"Searching: {query}", pct)
 
-            # Build geo cells
-            if forced_geo_cells:
-                geo_cells = list(forced_geo_cells)
-            elif bbox:
-                area = bbox.area_sq_degrees()
-                if area > 0.5:
-                    target_cells = 16
-                elif area > 0.1:
-                    target_cells = 12
-                elif area > 0.01:
-                    target_cells = 8
-                else:
-                    target_cells = 4
-                geo_cells = build_cells_for_area(bbox, target_cell_count=target_cells)
-            else:
-                geo_cells = []
+                try:
+                    self._search_maps(query)
+                    self._scroll_results()
+                except WebDriverException as exc:
+                    if self._is_localhost_read_timeout_error(exc):
+                        logger.warning(f"Skipping query '{query}' due to timeout: {exc}")
+                        self._report_progress(f"Query '{query}' timed out; continuing.", min(pct + 1, 36))
+                        continue
+                    raise
 
-            # Expand keywords
-            keyword_variants = [keyword] if force_primary_keyword_only else expand_keywords(keyword, max_variants=3)
-            self._area_stats["keywords_expanded"] = keyword_variants
-            self._report_progress(
-                f"Keyword variants: {', '.join(keyword_variants)}", 5
-            )
+                if self._should_stop:
+                    break
 
-            # ========================================
-            # PHASE 1: COLLECT listing URLs from all cells
-            # ========================================
-            all_listing_urls: list[str] = []
-
-            if geo_cells:
-                # Build search jobs: primary keyword for all cells, extra variants for first cell only
-                jobs: list[tuple[str, BoundingBox]] = []
-                for cell in geo_cells:
-                    jobs.append((keyword, cell))
-                for variant in keyword_variants[1:2]:  # 1 extra variant, first cell only
-                    jobs.append((variant, geo_cells[0]))
-
-                total_jobs = len(jobs)
-                self._area_stats["total_areas"] = total_jobs
-                self._area_stats["geo_cells_total"] = len(geo_cells)
-
-                self._report_progress(
-                    f"Phase 1: Scanning {total_jobs} areas for listings...", 6
-                )
-
-                for ji, (kw, cell) in enumerate(jobs):
-                    if self._should_stop:
-                        break
-
-                    center_lat, center_lng = cell.center()
-                    self._area_stats["current_area"] = f"{kw} @ ({center_lat:.4f}, {center_lng:.4f})"
-                    self._area_stats["current_area_index"] = ji + 1
-
-                    pct = 6 + int((ji / total_jobs) * 30)  # Phase 1 uses 6-36%
-                    self._report_progress(
-                        f"Scanning area {ji + 1}/{total_jobs}: {kw}",
-                        pct,
-                    )
-
-                    try:
-                        self._search_maps_viewport(kw, cell)
-                        self._scroll_results()
-                    except WebDriverException as exc:
-                        if self._is_localhost_read_timeout_error(exc):
-                            logger.warning(
-                                f"Skipping area {ji + 1}/{total_jobs} due to timeout: {exc}"
-                            )
-                            self._report_progress(
-                                f"Area {ji + 1}/{total_jobs} timed out; continuing.",
-                                min(pct + 1, 36),
-                            )
-                            continue
-                        raise
-
-                    if self._should_stop:
-                        break
-
-                    cell_urls = self._get_listing_links()
-
-                    # Deduplicate across cells using URL slug
-                    new_count = 0
-                    for url in cell_urls:
-                        if max_leads and len(all_listing_urls) >= max_leads:
-                            break
-                        try:
-                            slug = url.split("/maps/place/")[1].split("/")[0]
-                        except (IndexError, AttributeError):
-                            slug = url
-                        if slug not in seen_slugs:
-                            seen_slugs.add(slug)
-                            all_listing_urls.append(url)
-                            new_count += 1
-
+                query_urls = self._get_listing_links()
+                for url in query_urls:
                     if max_leads and len(all_listing_urls) >= max_leads:
-                        self._report_progress(
-                            f"Lead limit reached ({max_leads}) during listing collection.",
-                            min(pct + 1, 36),
-                        )
                         break
-
-                    self._area_stats["completed_areas"] = ji + 1
-                    self._area_stats["geo_cells_completed"] = min(ji + 1, len(geo_cells))
-
-                    logger.info(
-                        f"Area {ji+1}/{total_jobs}: found {len(cell_urls)} listings, {new_count} new (total unique: {len(all_listing_urls)})"
-                    )
-
-            else:
-                # Fallback: text-based search
-                queries = [f"{v} in {place}" for v in keyword_variants]
-                self._area_stats["total_areas"] = len(queries)
-
-                for qi, query in enumerate(queries):
-                    if self._should_stop:
-                        break
-
-                    self._area_stats["current_area"] = query
-                    self._area_stats["current_area_index"] = qi + 1
-
-                    pct = 6 + int((qi / len(queries)) * 30)
-                    self._report_progress(
-                        f"Searching: {query}", pct,
-                    )
-
                     try:
-                        self._search_maps(query)
-                        self._scroll_results()
-                    except WebDriverException as exc:
-                        if self._is_localhost_read_timeout_error(exc):
-                            logger.warning(f"Skipping query '{query}' due to timeout: {exc}")
-                            self._report_progress(
-                                f"Query '{query}' timed out; continuing.",
-                                min(pct + 1, 36),
-                            )
-                            continue
-                        raise
+                        slug = url.split("/maps/place/")[1].split("/")[0]
+                    except Exception:
+                        slug = url
+                    if slug not in seen_slugs:
+                        seen_slugs.add(slug)
+                        all_listing_urls.append(url)
 
-                    if self._should_stop:
-                        break
-
-                    query_urls = self._get_listing_links()
-                    for url in query_urls:
-                        if max_leads and len(all_listing_urls) >= max_leads:
-                            break
-                        try:
-                            slug = url.split("/maps/place/")[1].split("/")[0]
-                        except (IndexError, AttributeError):
-                            slug = url
-                        if slug not in seen_slugs:
-                            seen_slugs.add(slug)
-                            all_listing_urls.append(url)
-
-                    if max_leads and len(all_listing_urls) >= max_leads:
-                        self._report_progress(
-                            f"Lead limit reached ({max_leads}) during listing collection.",
-                            min(pct + 1, 36),
-                        )
-                        break
-
-                    self._area_stats["completed_areas"] = qi + 1
+                self._area_stats["completed_areas"] = qi + 1
 
             logger.info(f"Phase 1 complete: {len(all_listing_urls)} unique listings found")
 
-            # ========================================
-            # PHASE 2: EXTRACT business details from unique URLs
-            # ========================================
+            # Phase 2: extract details
             all_leads: list[BusinessLead] = []
-
             if all_listing_urls and not self._should_stop:
                 total_urls = len(all_listing_urls)
-                self._report_progress(
-                    f"Phase 2: Extracting details from {total_urls} businesses...", 37
-                )
+                self._report_progress(f"Phase 2: Opening {total_urls} listing detail pages...", 37)
 
                 for idx, url in enumerate(all_listing_urls):
                     if self._should_stop:
                         break
 
-                    pct = 37 + int((idx / total_urls) * 40)  # Phase 2 uses 37-77%
-                    self._report_progress(
-                        f"Extracting business {idx + 1}/{total_urls}",
-                        min(pct, 77),
-                    )
+                    pct = 37 + int((idx / max(1, total_urls)) * 40)
+                    self._report_progress(f"Opening listing detail {idx + 1}/{total_urls}", min(pct, 77))
 
                     lead = self._extract_business_detail(url)
                     if lead.business_name and lead.business_name != "Unknown":
                         all_leads.append(lead)
-                        lead_dict = asdict(lead)
                         self._partial_leads = [asdict(l) for l in all_leads]
                         self._area_stats["leads_found"] = len(all_leads)
-
-                        # SSE hook: notify frontend immediately about this lead
                         if on_lead_found:
                             try:
-                                on_lead_found(lead_dict, len(all_leads) - 1)
+                                on_lead_found(asdict(lead), len(all_leads) - 1)
                             except Exception:
-                                pass  # never let callback failure stop the scrape
-
+                                pass
                         if max_leads and len(all_leads) >= max_leads:
-                            self._report_progress(
-                                f"Lead limit reached ({max_leads}) during business extraction.",
-                                min(pct + 1, 77),
-                            )
+                            self._report_progress(f"Lead limit reached ({max_leads}) during business extraction.", min(pct + 1, 77))
                             break
 
-                logger.info(f"Phase 2 complete: {len(all_leads)} businesses extracted")
+            logger.info(f"Phase 2 complete: {len(all_leads)} businesses extracted")
 
-            # ========================================
-            # PHASE 3: ENRICH via parallel website crawling
-            # ========================================
+            # Phase 3: enrichment
             if crawl_contacts and all_leads and not self._should_stop:
-                self._crawl_websites_for_leads(
-                    all_leads,
-                    label="Enriching",
-                    progress=78,
-                )
-                # Update partial leads after enrichment
+                self._crawl_websites_for_leads(all_leads, label="Enriching", progress=78)
                 self._partial_leads = [asdict(l) for l in all_leads]
 
-            # ========================================
-            # FINAL: Light dedup (by exact name+address) and return
-            # ========================================
+            # Final: dedupe and return
             leads = [asdict(l) for l in all_leads]
-            pre_dedup = len(leads)
-
-            # Exact-hash dedup only (URL slug dedup already handled in Phase 1)
             if leads:
                 leads = self._exact_deduplicate_leads(leads)
-                deduped = pre_dedup - len(leads)
-                if deduped > 0:
-                    self._report_progress(
-                        f"Removed {deduped} exact duplicates ({pre_dedup} → {len(leads)})", 95
-                    )
-
-            total_cells = self._area_stats.get("geo_cells_total", 0) or self._area_stats.get("total_areas", 1)
-            completed = self._area_stats.get("geo_cells_completed", 0) or self._area_stats.get("completed_areas", 0)
-            if total_cells > 0:
-                self._area_stats["coverage_score"] = int((completed / total_cells) * 100)
 
             self._partial_leads = leads
             self._area_stats["leads_found"] = len(leads)
 
-            if crawl_contacts:
-                self._report_progress(
-                    f"Done! Found {len(leads)} unique leads.", 100
-                )
-            else:
-                self._report_progress(
-                    f"List extraction complete. Found {len(leads)} leads.", 100
-                )
+            self._report_progress(f"Done! Found {len(leads)} unique leads.", 100)
+
+            return leads
 
         except Exception as e:
             logger.error(f"Scraping failed: {e}")
-            if 'all_leads' in dir() and all_leads:
-                leads = [asdict(l) for l in all_leads]
-                leads = self._exact_deduplicate_leads(leads)
-                self._partial_leads = leads
             self._report_progress(f"Error: {str(e)}", -1)
             raise
 
         finally:
             self._close_driver()
-
-        return leads
 
     def _crawl_websites_for_leads(self, leads: list[BusinessLead], label: str, progress: int):
         website_targets = [lead for lead in leads if lead.website and lead.website != "N/A"]

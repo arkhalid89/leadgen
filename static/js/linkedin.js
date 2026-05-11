@@ -297,17 +297,18 @@ document.addEventListener("DOMContentLoaded", () => {
           : "N/A";
 
       // Seniority badge with color coding
-      let seniorityBadge = 'N/A';
-      const sl = (l.seniority_level || '').toLowerCase();
-      if (sl && sl !== 'n/a') {
-        let cls = 'bg-secondary';
-        if (sl.includes('c-suite')) cls = 'bg-warning text-dark';
-        else if (sl.includes('vp')) cls = 'bg-primary';
-        else if (sl.includes('director')) cls = 'bg-info text-dark';
-        else if (sl.includes('manager')) cls = 'bg-success';
-        else if (sl.includes('senior')) cls = 'bg-dark';
-        else if (sl.includes('partner') || sl.includes('owner')) cls = 'bg-warning text-dark';
-        else if (sl.includes('entry')) cls = 'bg-light text-dark';
+      let seniorityBadge = "N/A";
+      const sl = (l.seniority_level || "").toLowerCase();
+      if (sl && sl !== "n/a") {
+        let cls = "bg-secondary";
+        if (sl.includes("c-suite")) cls = "bg-warning text-dark";
+        else if (sl.includes("vp")) cls = "bg-primary";
+        else if (sl.includes("director")) cls = "bg-info text-dark";
+        else if (sl.includes("manager")) cls = "bg-success";
+        else if (sl.includes("senior")) cls = "bg-dark";
+        else if (sl.includes("partner") || sl.includes("owner"))
+          cls = "bg-warning text-dark";
+        else if (sl.includes("entry")) cls = "bg-light text-dark";
         seniorityBadge = `<span class="badge ${cls}">${escapeHtml(l.seniority_level)}</span>`;
       }
 
@@ -354,7 +355,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // UI helpers
   function showProgress() {
-    progressSection.style.display = "";
+    progressSection.classList.remove("is-hidden");
     progressBar.style.width = "0%";
     progressBar.classList.add("progress-bar-animated");
     progressMessage.textContent = "Starting...";
@@ -365,17 +366,17 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function hideProgress() {
-    progressSection.style.display = "none";
+    progressSection.classList.add("is-hidden");
     const liveStats = document.getElementById("liveStats");
-    if (liveStats) liveStats.style.display = "none";
+    if (liveStats) liveStats.classList.add("is-hidden");
   }
 
   function showResults() {
-    resultsSection.style.display = "";
+    resultsSection.classList.remove("is-hidden");
   }
 
   function hideResults() {
-    resultsSection.style.display = "none";
+    resultsSection.classList.add("is-hidden");
     profilesBody.innerHTML = "";
     companiesBody.innerHTML = "";
     allLeads = [];
@@ -383,12 +384,12 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function showError(msg) {
-    errorSection.style.display = "";
+    errorSection.classList.remove("is-hidden");
     errorMessage.textContent = msg;
   }
 
   function hideError() {
-    errorSection.style.display = "none";
+    errorSection.classList.add("is-hidden");
   }
 
   function setFormEnabled(enabled) {

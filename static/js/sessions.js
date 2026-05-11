@@ -42,6 +42,7 @@
   const btnForceRetryFromAnchor = document.getElementById(
     "btnForceRetryFromAnchor",
   );
+  const actionStatus = document.getElementById("sessionsActionStatus");
   const detailDiagnosticsSummary = document.getElementById(
     "detailDiagnosticsSummary",
   );
@@ -53,6 +54,57 @@
   let canManageTaskActions = false;
   const pendingActionBySession = new Set();
   let isRefreshing = false;
+
+  function showActionStatus(message, tone = "secondary") {
+    if (!actionStatus) return;
+    const safeTone = String(tone || "secondary").toLowerCase();
+    const allowed = new Set([
+      "secondary",
+      "success",
+      "warning",
+      "danger",
+      "info",
+    ]);
+    const finalTone = allowed.has(safeTone) ? safeTone : "secondary";
+    actionStatus.className = `alert alert-${finalTone} py-2 px-3 mb-3`;
+    actionStatus.textContent = String(message || "");
+    actionStatus.classList.remove("d-none");
+  }
+
+  function hideActionStatus() {
+    if (!actionStatus) return;
+    actionStatus.classList.add("d-none");
+    actionStatus.textContent = "";
+  }
+
+  function setDetailActionButtonsDisabled(disabled) {
+    [
+      btnRecoverStaleTasks,
+      btnAutoRecoverSession,
+      btnRetryFromAnchor,
+      btnForceRetryFromAnchor,
+    ].forEach((btn) => {
+      if (btn) btn.disabled = !!disabled;
+    });
+  }
+
+  function resetDetailPanel() {
+    selectedSessionId = "";
+    currentResumeAnchor = null;
+    canManageTaskActions = false;
+    if (detailCard) detailCard.classList.add("is-hidden");
+    if (detailSessionId) detailSessionId.textContent = "";
+    if (detailSummary) detailSummary.textContent = "—";
+    renderSessionLeads([]);
+    renderLogs([]);
+    renderTasks([]);
+    renderTaskMeta({}, {});
+    renderAuditEvents([]);
+    renderSessionDiagnostics({});
+    renderRetentionStatus(null);
+    if (detailRetentionWrap) detailRetentionWrap.classList.add("is-hidden");
+    setDetailActionButtonsDisabled(true);
+  }
 
   function renderOpsAlerts(alerts) {
     if (!opsAlertsBody) return;
@@ -240,12 +292,14 @@
         const noRetryNeeded =
           String(resumeAnchor.suggested_action || "").toLowerCase() ===
           "completed_no_resume_needed";
-        if (btnRetryFromAnchor) btnRetryFromAnchor.disabled = noRetryNeeded;
+        if (btnRetryFromAnchor)
+          btnRetryFromAnchor.disabled = noRetryNeeded || !selectedSessionId;
         if (btnForceRetryFromAnchor)
           btnForceRetryFromAnchor.disabled =
             noRetryNeeded ||
             !resumeAnchor.suggested_task_key ||
-            !canManageTaskActions;
+            !canManageTaskActions ||
+            !selectedSessionId;
       }
     }
 
@@ -335,7 +389,7 @@
           await loadSessionDetails();
           await loadSessions(false);
         } catch (e) {
-          alert(e.message || "Task action failed");
+          showActionStatus(e.message || "Task action failed", "danger");
           await loadSessionDetails();
         }
       });
@@ -416,13 +470,22 @@
   }
 
   function renderRows(sessions) {
-    if (!sessions.length) {
+    const rows = Array.isArray(sessions) ? sessions : [];
+    if (!rows.length) {
       body.innerHTML =
         '<tr><td colspan="8" class="text-center text-muted py-4">No active sessions.</td></tr>';
+      resetDetailPanel();
       return;
     }
 
-    body.innerHTML = sessions
+    const hasSelected = rows.some(
+      (s) => String(s.job_id || s.id || "") === selectedSessionId,
+    );
+    if (!hasSelected) {
+      selectedSessionId = String(rows[0].job_id || rows[0].id || "");
+    }
+
+    body.innerHTML = rows
       .map((s) => {
         const stage =
           s.phase === "contacts" ? "Contact Retrieval" : "List Extraction";
@@ -464,7 +527,8 @@
             </div>`
           : `<span class="text-muted small">—</span>`;
 
-        return `<tr class="session-row session-row-clickable" data-id="${esc(sid)}">
+        const selectedClass = sid === selectedSessionId ? "table-active" : "";
+        return `<tr class="session-row session-row-clickable ${selectedClass}" data-id="${esc(sid)}">
           <td><strong>${esc(sid)}</strong></td>
           <td>${esc((s.keyword || "") + " in " + (s.place || ""))}</td>
           <td>${esc(stage)} <span class="text-muted small">(${esc(contactsStatus)})</span></td>
@@ -489,6 +553,7 @@
         }
         selectedSessionId = row.dataset.id;
         await loadSessionDetails();
+        renderRows(rows);
       });
     });
 
@@ -498,10 +563,14 @@
         pendingActionBySession.add(b.dataset.id);
         try {
           await callAction(`/api/gmaps/contacts/start/${b.dataset.id}`);
+          showActionStatus("Contact retrieval started.", "success");
           await loadSessions();
           if (selectedSessionId === b.dataset.id) await loadSessionDetails();
         } catch (e) {
-          alert(e.message);
+          showActionStatus(
+            e.message || "Failed to start contact retrieval.",
+            "danger",
+          );
         } finally {
           pendingActionBySession.delete(b.dataset.id);
         }
@@ -517,10 +586,11 @@
               ? `/api/gmaps/contacts/pause/${b.dataset.id}`
               : `/api/gmaps/extract/pause/${b.dataset.id}`;
           await callAction(endpoint);
+          showActionStatus("Pause requested.", "info");
           await loadSessions();
           if (selectedSessionId === b.dataset.id) await loadSessionDetails();
         } catch (e) {
-          alert(e.message);
+          showActionStatus(e.message || "Failed to pause session.", "danger");
         } finally {
           pendingActionBySession.delete(b.dataset.id);
         }
@@ -536,10 +606,11 @@
               ? `/api/gmaps/contacts/resume/${b.dataset.id}`
               : `/api/gmaps/extract/restart/${b.dataset.id}`;
           await callAction(endpoint);
+          showActionStatus("Resume action submitted.", "success");
           await loadSessions();
           if (selectedSessionId === b.dataset.id) await loadSessionDetails();
         } catch (e) {
-          alert(e.message);
+          showActionStatus(e.message || "Failed to resume session.", "danger");
         } finally {
           pendingActionBySession.delete(b.dataset.id);
         }
@@ -555,15 +626,20 @@
               ? `/api/gmaps/contacts/restart/${b.dataset.id}`
               : `/api/gmaps/extract/restart/${b.dataset.id}`;
           await callAction(endpoint);
+          showActionStatus("Restart action submitted.", "warning");
           await loadSessions();
           if (selectedSessionId === b.dataset.id) await loadSessionDetails();
         } catch (e) {
-          alert(e.message);
+          showActionStatus(e.message || "Failed to restart session.", "danger");
         } finally {
           pendingActionBySession.delete(b.dataset.id);
         }
       });
     });
+
+    if (selectedSessionId) {
+      loadSessionDetails();
+    }
   }
 
   function renderSessionLeads(leads) {
@@ -607,6 +683,7 @@
 
       const summary = data.summary || {};
       canManageTaskActions = !!data.operator_controls?.can_manage_tasks;
+      setDetailActionButtonsDisabled(false);
       if (detailSummary) {
         detailSummary.textContent = `Completion ${summary.completion_rate || 0}% — ${summary.complete_count || 0} complete / ${summary.incomplete_count || 0} incomplete / ${summary.total || 0} total`;
       }
@@ -619,6 +696,7 @@
       await loadRetentionStatus();
     } catch (e) {
       canManageTaskActions = false;
+      setDetailActionButtonsDisabled(true);
       if (detailSummary)
         detailSummary.textContent =
           e.message || "Failed to load session details.";
@@ -642,19 +720,25 @@
     }
     try {
       const res = await fetch("/api/gmaps/sessions");
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Failed to load sessions");
       renderRows(data.sessions || []);
     } catch (e) {
       if (showLoading) {
         body.innerHTML =
           '<tr><td colspan="8" class="text-center text-danger py-4">Failed to load sessions.</td></tr>';
       }
+      showActionStatus(e.message || "Failed to load sessions.", "danger");
     } finally {
       isRefreshing = false;
     }
   }
 
-  if (refreshBtn) refreshBtn.addEventListener("click", loadSessions);
+  if (refreshBtn)
+    refreshBtn.addEventListener("click", async () => {
+      hideActionStatus();
+      await loadSessions();
+    });
   if (btnRefreshOps) {
     btnRefreshOps.addEventListener("click", async () => {
       await loadOpsDashboard();
@@ -671,10 +755,14 @@
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || "Recovery failed");
+        showActionStatus(
+          data.message || "Stale task recovery complete.",
+          "success",
+        );
         await loadSessionDetails();
         await loadSessions(false);
       } catch (e) {
-        alert(e.message || "Recovery failed");
+        showActionStatus(e.message || "Recovery failed", "danger");
       } finally {
         btnRecoverStaleTasks.disabled = false;
       }
@@ -691,11 +779,17 @@
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || "Suggested recovery failed");
+        showActionStatus(
+          data.message || "Suggested recovery applied.",
+          "success",
+        );
         await loadSessionDetails();
         await loadSessions(false);
       } catch (e) {
-        alert(e.message || "Suggested recovery failed");
+        showActionStatus(e.message || "Suggested recovery failed", "danger");
         await loadSessionDetails();
+      } finally {
+        btnRetryFromAnchor.disabled = false;
       }
     });
   }
@@ -724,11 +818,14 @@
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || "Force retry failed");
+        showActionStatus(data.message || "Force retry submitted.", "warning");
         await loadSessionDetails();
         await loadSessions(false);
       } catch (e) {
-        alert(e.message || "Force retry failed");
+        showActionStatus(e.message || "Force retry failed", "danger");
         await loadSessionDetails();
+      } finally {
+        btnForceRetryFromAnchor.disabled = false;
       }
     });
   }
@@ -747,11 +844,12 @@
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || "Auto recovery failed");
+        showActionStatus(data.message || "Auto recovery completed.", "success");
         await loadSessionDetails();
         await loadSessions(false);
         await loadOpsDashboard();
       } catch (e) {
-        alert(e.message || "Auto recovery failed");
+        showActionStatus(e.message || "Auto recovery failed", "danger");
         await loadSessionDetails();
       } finally {
         btnAutoRecoverSession.disabled = false;
@@ -778,6 +876,7 @@
   if (btnRetentionRefresh) {
     btnRetentionRefresh.addEventListener("click", async () => {
       await loadRetentionStatus();
+      showActionStatus("Retention status refreshed.", "info");
     });
   }
   if (btnRetentionExportArchive) {
@@ -792,13 +891,15 @@
         Math.min(20000, Number(retentionArchiveLimit?.value || 5000)),
       );
       window.location.href = `/api/gmaps/retention/archive.csv?table=${encodeURIComponent(table)}&older_than_days=${encodeURIComponent(String(days))}&limit=${encodeURIComponent(String(limit))}`;
+      showActionStatus("Archive export started.", "info");
     });
   }
+  setDetailActionButtonsDisabled(true);
   loadOpsDashboard();
   loadSessions(true);
   setInterval(async () => {
+    if (document.hidden) return;
     await loadOpsDashboard();
     await loadSessions(false);
-    if (selectedSessionId) await loadSessionDetails();
-  }, 3000);
+  }, 10000);
 })();

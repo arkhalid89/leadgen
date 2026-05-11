@@ -129,6 +129,12 @@ def run_worker(queue_name: str):
             # ── 5. Create throttled progress callback ──
             _last_progress_write = [0.0]
 
+            # Try to import SSE publisher so worker progress is pushed in real-time
+            try:
+                from api.sse import publish as _sse_publish
+            except Exception:
+                _sse_publish = None
+
             def progress_cb(message: str, percent: int, snapshot: dict | None = None):
                 now_ts = time.time()
                 # Throttle DB writes
@@ -164,6 +170,21 @@ def run_worker(queue_name: str):
                         upd["result"] = json.dumps(existing, default=str)
                 update_job(job_id, upd)
 
+                # Also push a lightweight SSE event for real-time UI updates
+                try:
+                    if _sse_publish:
+                        evt = {
+                            "percent": max(0, min(100, percent)),
+                            "message": message[:500],
+                        }
+                        if snapshot:
+                            evt["results_count"] = int(snapshot.get("results_count") or snapshot.get("lead_count") or 0)
+                            if "area_stats" in snapshot:
+                                evt["area_stats"] = snapshot.get("area_stats")
+                        _sse_publish(job_id, "geocell_progress", evt)
+                except Exception:
+                    pass
+
             # Create stop-check callback
             from jobs.queue import is_stop_requested
 
@@ -190,6 +211,17 @@ def run_worker(queue_name: str):
                 final_updates["result"] = json.dumps(result["result"], default=str)
 
             update_job(job_id, final_updates)
+
+            # Publish final SSE completion event for real-time UI
+            try:
+                if _sse_publish:
+                    _sse_publish(job_id, "job_completed", {
+                        "status": final_status,
+                        "result_count": final_updates.get("result_count", 0),
+                        "message": final_updates.get("message", ""),
+                    })
+            except Exception:
+                pass
 
             hb_stop.set()
             ack_job(raw_payload)
