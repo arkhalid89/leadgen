@@ -1,148 +1,39 @@
 services:
-  leadgen:
-    build: .
-    container_name: leadgen-app
+  api:
+    build:
+      context: .
+      target: api
+    container_name: leadgen-api
+    restart: unless-stopped
     ports:
-      - "5000:5000"
-    volumes:
-      - leadgen-output:/app/output
-      - leadgen-data:/app/data
-    env_file:
-      - .env
+      - "8000:8000"
     environment:
-      - LEADGEN_DB_PATH=/app/data/leadgen.db
-      - LEADGEN_POSTGRES_DSN=${LEADGEN_POSTGRES_DSN:-postgresql://leadgen:leadgen@postgres:5432/leadgen}
-      - LEADGEN_OUTPUT_DIR=/app/output
-      - REDIS_HOST=redis
-      - FLASK_ENV=production
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
-    # Chrome/Chromium needs extra shared memory for rendering
-    shm_size: "2gb"
-    # Resource limits tuned for Oracle Cloud Free Tier (4 OCPU / 24GB RAM)
-    deploy:
-      resources:
-        limits:
-          cpus: "3.0"
-          memory: 8G
-        reservations:
-          cpus: "1.0"
-          memory: 2G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      LEADGEN_SECRET_KEY: ${LEADGEN_SECRET_KEY:?set LEADGEN_SECRET_KEY in .env}
+      LEADGEN_ALLOWED_ORIGINS: ${LEADGEN_ALLOWED_ORIGINS:-http://localhost:3600}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      # Each detail worker is a Chromium process; raise only with memory to spare.
+      LEADGEN_GMAPS_DETAIL_WORKERS: ${LEADGEN_GMAPS_DETAIL_WORKERS:-4}
+    volumes:
+      - leadgen-data:/app/data
+      - leadgen-output:/app/output
+    # Chromium needs more than Docker's default 64 MB of shared memory.
+    shm_size: 1gb
 
-  # --- Phase 2: Redis Queue ---
-  redis:
-    image: redis:7-alpine
-    container_name: leadgen-redis
+  web:
+    build:
+      context: .
+      target: frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    container_name: leadgen-web
+    restart: unless-stopped
     ports:
-      - "6379:6379"
-    volumes:
-      - leadgen-redis:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # --- Phase 2: Worker for lightweight jobs (LinkedIn, Instagram, WebCrawler) ---
-  worker-default:
-    build: .
-    container_name: leadgen-worker-default
-    command: python -m workers.worker --queue default
-    volumes:
-      - leadgen-output:/app/output
-      - leadgen-data:/app/data
-    env_file:
-      - .env
-    environment:
-      - LEADGEN_DB_PATH=/app/data/leadgen.db
-      - LEADGEN_POSTGRES_DSN=${LEADGEN_POSTGRES_DSN:-postgresql://leadgen:leadgen@postgres:5432/leadgen}
-      - LEADGEN_OUTPUT_DIR=/app/output
-      - REDIS_HOST=redis
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 2G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - "3600:3600"
     depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-
-  # --- Phase 2: Worker for heavy jobs (Google Maps / Selenium) ---
-  worker-heavy:
-    build: .
-    container_name: leadgen-worker-heavy
-    command: python -m workers.worker --queue heavy
-    volumes:
-      - leadgen-output:/app/output
-      - leadgen-data:/app/data
-    env_file:
-      - .env
-    environment:
-      - LEADGEN_DB_PATH=/app/data/leadgen.db
-      - LEADGEN_POSTGRES_DSN=${LEADGEN_POSTGRES_DSN:-postgresql://leadgen:leadgen@postgres:5432/leadgen}
-      - LEADGEN_OUTPUT_DIR=/app/output
-      - REDIS_HOST=redis
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
-    shm_size: "2gb"
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 6G
-        reservations:
-          cpus: "0.5"
-          memory: 1G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: leadgen-postgres
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-leadgen}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-leadgen}
-      - POSTGRES_DB=${POSTGRES_DB:-leadgen}
-    volumes:
-      - leadgen-postgres:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - api
 
 volumes:
-  leadgen-output:
   leadgen-data:
-  leadgen-postgres:
-  leadgen-redis:
+  leadgen-output:

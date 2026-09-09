@@ -1,30 +1,16 @@
-# Keep Docker build context small and secure
-__pycache__/
+.git
+.gitignore
+.venv
+venv
+__pycache__
 *.pyc
-*.pyo
-venv/
-.venv/
+*.db
+*.db-shm
+*.db-wal
+*.db.backup-*
+output
+web/node_modules
+web/.next
 .env
 .env.local
-.env.production
-.git/
-.gitignore
-.DS_Store
-output/
-data/
-build/
-dist/
-
-# Desktop/build files — not for cloud
-desktop.py
-build_mac.sh
-build_win.bat
-leadgen.spec
-leadgen.db
-
-# IDE
-.vscode/
-.idea/
-
-# Docs (keep README out of image)
-README.md
+scripts/__pycache__

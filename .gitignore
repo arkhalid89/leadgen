@@ -1,78 +1,31 @@
-# ==========================================
-# Python
-# ==========================================
+# --- python ---
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg
-*.egg-info/
-dist/
-build/
-*.whl
-*.so
-
-# ==========================================
-# Virtual environments
-# ==========================================
-venv/
+*.py[cod]
 .venv/
+venv/
 env/
 
-# ==========================================
-# Environment / secrets
-# ==========================================
+# --- environment ---
 .env
 .env.local
-.env.production
-*.pem
-*.key
 
-# ==========================================
-# Database (local dev only — prod uses cloud)
-# ==========================================
-leadgen.db
-*.db-journal
-*.db-wal
+# --- data (yours, not the repo's) ---
+*.db
 *.db-shm
-
-# ==========================================
-# Output / data (generated at runtime)
-# ==========================================
+*.db-wal
+*.db.backup-*
 output/
-data/
-*.csv
 
-# ==========================================
-# Desktop / build artifacts (NOT for cloud)
-# ==========================================
-desktop.py
-build_mac.sh
-build_win.bat
-leadgen.spec
-build/
-dist/
-*.dmg
-*.exe
-*.app
+# --- node / next ---
+node_modules/
+.next/
+out/
+web/.env.local
+npm-debug.log*
+yarn-error.log*
 
-# ==========================================
-# OS files
-# ==========================================
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-
-# ==========================================
-# IDE
-# ==========================================
+# --- editors / os ---
 .vscode/
 .idea/
-*.code-workspace
-
-# ==========================================
-# Docker local overrides
-# ==========================================
-docker-compose.override.yml
+.DS_Store
+Thumbs.db

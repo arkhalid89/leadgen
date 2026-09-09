@@ -1,83 +1,69 @@
-FROM python:3.11-slim
+# --- stage 1: build the Next.js frontend -----------------------------------
+FROM node:22-slim AS web
 
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-# Production defaults
-ENV FLASK_ENV=production
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV GUNICORN_WORKERS=2
-ENV GUNICORN_THREADS=4
-ENV GUNICORN_TIMEOUT=300
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 
-# Install Chromium (works on both amd64 AND arm64 — required for Oracle Cloud ARM)
-# Also installs matching chromedriver so Selenium can find it automatically
+COPY web/ ./
+# Baked into the client bundle at build time; override for a real deployment.
+ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+RUN npm run build
+
+
+# --- stage 2: the API, with Chromium for scraping ---------------------------
+FROM python:3.12-slim AS api
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CHROME_BIN=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver
+
+# Chromium plus the shared libraries headless Chrome still links against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
-    chromium-driver \
-    curl \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libcups2 \
-    libdbus-1-3 \
-    libdrm2 \
-    libgbm1 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libxss1 \
-    libxtst6 \
-    libx11-xcb1 \
-    libxcb-dri3-0 \
-    libpango-1.0-0 \
-    libcairo2 \
-    xdg-utils \
-    && apt-get clean \
+        chromium chromium-driver \
+        fonts-liberation libnss3 libxss1 libasound2 libgbm1 \
+        ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Selenium where to find Chromium and chromedriver
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
-# Prevent Selenium Manager from trying to download Chrome/chromedriver
-ENV SE_AVOID_BROWSER_DOWNLOAD=true
-
-# Create a non-root user for security
-RUN groupadd -r leadgen && useradd -r -g leadgen -d /app -s /sbin/nologin leadgen
-
-# Set working directory
 WORKDIR /app
 
-# Copy requirements first for layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy ONLY production code (no desktop/build files)
-COPY app.py scraper.py linkedin_scraper.py instagram_scraper.py web_crawler.py ./
-COPY config.py ./
-COPY geo/ geo/
-COPY utils/ utils/
-COPY workers/ workers/
-COPY task_queue/ task_queue/
-COPY jobs/ jobs/
-COPY templates/ templates/
-COPY static/ static/
+COPY server/ ./server/
+COPY scripts/ ./scripts/
+COPY run.py .
 
-# Create output and data directories
-RUN mkdir -p output data && chown -R leadgen:leadgen /app
-
-# Switch to non-root user
+RUN mkdir -p /app/data /app/output && useradd -m -u 1000 leadgen \
+    && chown -R leadgen:leadgen /app
 USER leadgen
 
-# Expose port
-EXPOSE 5000
+ENV LEADGEN_DB_PATH=/app/data/leadgen.db \
+    LEADGEN_OUTPUT_DIR=/app/output \
+    LEADGEN_ENV=production \
+    LEADGEN_HOST=0.0.0.0 \
+    LEADGEN_PORT=8000
 
-# Health check for container orchestrators
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:5000/health || exit 1
+EXPOSE 8000
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:5000 --workers ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS} --timeout ${GUNICORN_TIMEOUT} --access-logfile - --error-logfile - --log-level info app:app"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+CMD ["python", "run.py"]
+
+
+# --- stage 3: the frontend runtime -----------------------------------------
+FROM node:22-slim AS frontend
+
+WORKDIR /web
+ENV NODE_ENV=production
+
+COPY --from=web /web/.next ./.next
+COPY --from=web /web/public ./public
+COPY --from=web /web/node_modules ./node_modules
+COPY --from=web /web/package.json ./
+
+EXPOSE 3600
+CMD ["npm", "run", "start"]
