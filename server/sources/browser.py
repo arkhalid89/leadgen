@@ -1,11 +1,26 @@
-"""Headless Chrome helpers shared by the scraping sources."""
+"""Headless Chromium, driven by Playwright.
+
+This replaced Selenium for two reasons that matter here.
+
+**Throughput.** Playwright talks to the browser over a persistent CDP
+connection rather than Selenium's HTTP-per-command protocol, and it waits for
+elements automatically instead of polling. Published scraping benchmarks put it
+at roughly twice Selenium's pages-per-minute.
+
+**Memory.** The Selenium version ran a *pool of separate Chrome processes* to
+get concurrency - five browsers, five times the startup cost and RAM. Playwright
+opens many pages inside one browser, so concurrency costs a tab rather than a
+process.
+
+Images, fonts, media and stylesheets are aborted at the network layer. We only
+ever read the DOM, and blocking them roughly halves page-load time.
+"""
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .. import settings
 
@@ -16,54 +31,81 @@ _UA = (
     "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 )
 
+# Nothing here is ever read from, and each one costs a request.
+BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet", "imageset"}
 
-def build_driver(headless: bool | None = None) -> webdriver.Chrome:
-    """Create a Chrome driver tuned for scraping speed.
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-notifications",
+    "--mute-audio",
+    "--lang=en-US",
+    "--disable-blink-features=AutomationControlled",
+]
 
-    Images, fonts and stylesheets are blocked: we only ever read the DOM, and
-    skipping them cuts page-load time roughly in half.
-    """
-    opts = Options()
-    if headless if headless is not None else settings.GMAPS_HEADLESS:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--lang=en-US")
-    opts.add_argument("--log-level=3")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-notifications")
-    opts.add_argument("--mute-audio")
-    opts.add_argument(f"--user-agent={_UA}")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
-    opts.add_experimental_option(
-        "prefs",
-        {
-            "profile.managed_default_content_settings.images": 2,
-            "profile.managed_default_content_settings.stylesheets": 1,
-            "profile.default_content_setting_values.notifications": 2,
-            "profile.managed_default_content_settings.plugins": 2,
-        },
-    )
-    if settings.CHROME_BINARY:
-        opts.binary_location = settings.CHROME_BINARY
 
-    if settings.CHROMEDRIVER_PATH:
-        driver = webdriver.Chrome(service=Service(executable_path=settings.CHROMEDRIVER_PATH), options=opts)
+async def _block_assets(route) -> None:
+    if route.request.resource_type in BLOCKED_RESOURCES:
+        await route.abort()
     else:
-        driver = webdriver.Chrome(options=opts)
-
-    driver.set_page_load_timeout(settings.GMAPS_PAGE_TIMEOUT)
-    driver.implicitly_wait(0)
-    return driver
+        await route.continue_()
 
 
-def quit_driver(driver) -> None:
-    if driver is None:
-        return
+class BrowserSession:
+    """One Chromium instance, shared by every page a job needs."""
+
+    def __init__(self, headless: bool | None = None):
+        self._headless = settings.GMAPS_HEADLESS if headless is None else headless
+        self._playwright = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+
+    async def start(self) -> None:
+        self._playwright = await async_playwright().start()
+        launch: dict = {"headless": self._headless, "args": LAUNCH_ARGS}
+        if settings.CHROME_BINARY:
+            launch["executable_path"] = settings.CHROME_BINARY
+        self._browser = await self._playwright.chromium.launch(**launch)
+        self._context = await self._browser.new_context(
+            user_agent=_UA,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            java_script_enabled=True,
+            service_workers="block",
+        )
+        self._context.set_default_timeout(settings.GMAPS_PAGE_TIMEOUT * 1000)
+        self._context.set_default_navigation_timeout(settings.GMAPS_PAGE_TIMEOUT * 1000)
+        await self._context.route("**/*", _block_assets)
+
+    async def new_page(self) -> Page:
+        if self._context is None:
+            raise RuntimeError("BrowserSession.start() was not awaited")
+        return await self._context.new_page()
+
+    async def close(self) -> None:
+        for closer in (
+            getattr(self._context, "close", None),
+            getattr(self._browser, "close", None),
+            getattr(self._playwright, "stop", None),
+        ):
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001 - shutdown must never raise
+                log.debug("browser shutdown step failed: %s", exc)
+        self._context = self._browser = self._playwright = None
+
+
+@asynccontextmanager
+async def browser_session(headless: bool | None = None):
+    """`async with browser_session() as session:` - always tears down."""
+    session = BrowserSession(headless=headless)
+    await session.start()
     try:
-        driver.quit()
-    except Exception as exc:  # noqa: BLE001 - shutdown must never raise
-        log.debug("driver quit failed: %s", exc)
+        yield session
+    finally:
+        await session.close()

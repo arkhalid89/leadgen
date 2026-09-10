@@ -14,6 +14,29 @@ over Server-Sent Events while it runs.
 | **Detail** | A pool of headless browsers (5 by default) opens listing pages *in parallel* for what the feed does not carry: **every phone number** the listing lists, and the canonical website. Skipped entirely in `fast` mode. | Not needed. |
 | **Emails** | Leads that still have no email have their website read over plain async HTTP — homepage plus up to 3 contact-ish pages — for every published address, plus social links. No API key, no model. | Same. |
 
+### Browser automation: Playwright
+
+Scraping runs on **Playwright**, not Selenium. The honest summary of why:
+
+* **Concurrency is a tab, not a process.** The Selenium version ran a pool of
+  separate Chrome instances to parallelise detail pages. Playwright opens many
+  pages inside one browser, so 8 concurrent readers cost 8 tabs rather than 8
+  browser process trees. Measured: 8 concurrent pages added 11 processes and
+  ~1.1 GB.
+* **Auto-waiting** removes the explicit sleeps and polling loops the Selenium
+  code needed, and with them a class of flaky timeouts.
+* Images, fonts, media and stylesheets are aborted at the network layer rather
+  than disabled through browser preferences, which is both more thorough and
+  more reliable.
+
+**On speed, be sceptical of the published 2x claims for this workload.** Those
+compare naive implementations. The Selenium version here was already reading
+most fields off the result feed and running detail pages in parallel, so most of
+the available win had been taken. Measured on the same query (dentist, Austin
+TX, 25 leads): Selenium 50.0s; Playwright 37.2s and 58.7s on two runs. The
+run-to-run variance from Google itself is larger than the difference between the
+drivers. Playwright was kept for the architecture, not a benchmark.
+
 ### Unlimited searches
 
 A single Google Maps search returns roughly **100-120 results and then stops**,
@@ -288,7 +311,7 @@ build state is tracked with a marker in `meta` instead.
 
 - Python 3.11+
 - Node.js 20+
-- Google Chrome or Chromium on `PATH`
+- Chromium, installed once with `python -m playwright install chromium`
 - No API key is required. A Gemini key ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)) is optional and only improves outreach copy
 
 ## Setup
@@ -296,6 +319,7 @@ build state is tracked with a marker in `meta` instead.
 ```bash
 python -m venv .venv && .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium
 cp .env.example .env        # set LEADGEN_SECRET_KEY; everything else has a default
 cd web && npm install && cd ..
 ```
@@ -378,7 +402,7 @@ server/            FastAPI backend
   sources/
     gmaps.py       Google Maps scraper (parallel detail pool)
     websearch.py   keyword -> business websites
-    browser.py     shared headless-Chrome setup
+    browser.py     Playwright session: one browser, many pages
   enrich/
     emails.py      website email discovery (free, no model)
     smtp_verify.py mailbox verification + role-mailbox discovery

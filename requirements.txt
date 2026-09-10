@@ -9,7 +9,7 @@ bcrypt==4.2.1
 itsdangerous==2.2.0
 
 # --- scraping ---
-selenium==4.27.1
+playwright==1.49.1
 ddgs>=9.16.0
 
 # --- http ---

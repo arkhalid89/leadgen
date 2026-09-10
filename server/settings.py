@@ -36,9 +36,10 @@ SESSION_COOKIE: str = "leadgen_session"
 SESSION_MAX_AGE: int = _env_int("LEADGEN_SESSION_MAX_AGE", 60 * 60 * 24 * 14)
 
 # --- Google Maps scraping ---------------------------------------------------
-# Number of headless browsers extracting listing detail pages concurrently.
-# This is the single biggest speed lever; the old code used exactly one.
-GMAPS_DETAIL_WORKERS: int = _env_int("LEADGEN_GMAPS_DETAIL_WORKERS", 5)
+# Concurrent tabs reading listing detail pages. Under Playwright these are tabs
+# in one browser rather than separate Chrome processes, so this can be higher
+# than it could with Selenium for the same memory.
+GMAPS_DETAIL_WORKERS: int = _env_int("LEADGEN_GMAPS_DETAIL_WORKERS", 8)
 GMAPS_HEADLESS: bool = _env_bool("LEADGEN_GMAPS_HEADLESS", True)
 GMAPS_SCROLL_ROUNDS: int = _env_int("LEADGEN_GMAPS_SCROLL_ROUNDS", 40)
 # One Google Maps search returns roughly 100-120 results however far you
@@ -57,6 +58,9 @@ GMAPS_SATURATION: int = _env_int("LEADGEN_GMAPS_SATURATION", 45)
 GMAPS_MAX_DEPTH: int = _env_int("LEADGEN_GMAPS_MAX_DEPTH", 3)
 # Hard ceiling on searches for one job, so an unlimited run still ends.
 GMAPS_MAX_SEARCHES: int = _env_int("LEADGEN_GMAPS_MAX_SEARCHES", 400)
+# Detail results are written back every this many businesses, so stopping
+# mid-phase keeps the phone numbers already gathered.
+GMAPS_DETAIL_BATCH: int = _env_int("LEADGEN_GMAPS_DETAIL_BATCH", 20)
 GMAPS_CELL_ZOOM: int = _env_int("LEADGEN_GMAPS_CELL_ZOOM", 15)
 GMAPS_CELL_SCROLLS: int = _env_int("LEADGEN_GMAPS_CELL_SCROLLS", 12)
 # Nominatim asks for a real identifying User-Agent and no more than 1 req/s.
@@ -64,8 +68,9 @@ GEOCODE_USER_AGENT: str = os.environ.get(
     "LEADGEN_GEOCODE_UA", "LeadGen/3.0 (business lead research)"
 )
 GMAPS_PAGE_TIMEOUT: float = _env_float("LEADGEN_GMAPS_PAGE_TIMEOUT", 20.0)
+# Optional: point Playwright at a specific Chromium build. Normally unset -
+# Playwright downloads and manages its own, matched to the driver version.
 CHROME_BINARY: str = os.environ.get("CHROME_BIN", "")
-CHROMEDRIVER_PATH: str = os.environ.get("CHROMEDRIVER_PATH", "")
 
 # --- Web search discovery ---------------------------------------------------
 SEARCH_MAX_QUERIES: int = _env_int("LEADGEN_SEARCH_MAX_QUERIES", 8)

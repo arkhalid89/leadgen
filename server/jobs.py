@@ -494,7 +494,11 @@ class JobManager:
             if source_name == "gmaps":
                 # Long runs save as they go, so stopping never loses work and
                 # results appear while the search is still going.
-                saved_uids: set[str] = set()
+                # Track what was last written for each lead, not merely which
+                # ones exist. Discovery finds the business; the detail phase
+                # then fills in phone and website on the *same* lead, so a
+                # seen-once check would silently discard every enrichment.
+                written: dict[str, str] = {}
 
                 def on_batch(found: list) -> None:
                     fresh = []
@@ -504,17 +508,23 @@ class JobManager:
                         lead["location"] = location
                         lead["source"] = source_name
                         uid = lead_uid(lead)
-                        if uid in saved_uids:
-                            continue
-                        saved_uids.add(uid)
                         lead["uid"] = uid
                         normalise_contacts(lead)
+                        signature = "%s|%s|%s|%s" % (
+                            lead.get("business_name", ""),
+                            lead.get("phone", ""),
+                            lead.get("website", ""),
+                            lead.get("address", ""),
+                        )
+                        if written.get(uid) == signature:
+                            continue
+                        written[uid] = signature
                         fresh.append(lead)
                     if fresh:
                         self._persist(job_id, user_id, fresh)
                         db.execute(
                             "UPDATE jobs SET total_found = ? WHERE id = ?",
-                            (len(saved_uids), job_id),
+                            (len(written), job_id),
                         )
 
                 source = GoogleMapsSource(

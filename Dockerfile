@@ -12,18 +12,14 @@ ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN npm run build
 
 
-# --- stage 2: the API, with Chromium for scraping ---------------------------
+# --- stage 2: the API, with Playwright + Chromium ---------------------------
 FROM python:3.12-slim AS api
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    CHROME_BIN=/usr/bin/chromium \
-    CHROMEDRIVER_PATH=/usr/bin/chromedriver
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
-# Chromium plus the shared libraries headless Chrome still links against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium chromium-driver \
-        fonts-liberation libnss3 libxss1 libasound2 libgbm1 \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +27,12 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Playwright ships its own pinned Chromium and installs the system libraries it
+# needs, so the browser matches the driver exactly rather than depending on
+# whatever version the distro happens to package.
+RUN python -m playwright install --with-deps chromium \
+    && chmod -R a+rx /opt/playwright
 
 COPY server/ ./server/
 COPY scripts/ ./scripts/
